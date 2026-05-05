@@ -1,0 +1,45 @@
+task: detection
+
+evaluator:
+  type: CocoEvaluator
+  iou_types: ['bbox', ]
+
+num_classes: 10
+remap_mscoco_category: False
+
+train_dataloader:
+  type: DataLoader
+  dataset:
+    type: CocoDetection
+    img_folder: /root/userfolder/Dataset/ObjectDetection/TCT_JPEGImages/train30000
+    ann_file: /root/userfolder/Dataset/ObjectDetection/TCT_JPEGImages/train30000-cocolike-cat10.json
+    # img_folder: /root/userfolder/Dataset/ObjectDetection/TCT_JPEGImages/train200
+    # ann_file: /root/userfolder/Dataset/ObjectDetection/TCT_JPEGImages/train200-cocolike-cat10.json
+    return_masks: False
+    transforms:
+      type: Compose
+      ops: ~
+  shuffle: True
+  num_workers: 4
+  drop_last: True
+  collate_fn:
+    type: BatchImageCollateFunction
+
+
+val_dataloader:
+  type: DataLoader
+  dataset:
+    type: CocoDetection
+    img_folder: /root/userfolder/Dataset/ObjectDetection/TCT_JPEGImages/val
+    ann_file: /root/userfolder/Dataset/ObjectDetection/TCT_JPEGImages/val5000-cocolike-cat10.json
+    # img_folder: /root/userfolder/Dataset/ObjectDetection/TCT_JPEGImages/train200
+    # ann_file: /root/userfolder/Dataset/ObjectDetection/TCT_JPEGImages/train200-cocolike-cat10.json
+    return_masks: False
+    transforms:
+      type: Compose
+      ops: ~
+  shuffle: False
+  num_workers: 4
+  drop_last: False
+  collate_fn:
+    type: BatchImageCollateFunction

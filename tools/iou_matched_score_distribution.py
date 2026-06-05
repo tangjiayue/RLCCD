@@ -507,7 +507,7 @@ def plot_tp_fp_distribution(tp_dict, fp_dict, save_path=None):
 
 # 使用示例
 if __name__ == "__main__":
-    json_file = "/root/userfolder/Projects/RLCCD/output/dfine_hgnetv2_m_ccd/6_1/26/detection_results/detection_results_epoch-1_20260423_115938.json"
+    json_file = "/root/userfolder/Projects/RLCCD/output/dfine_hgnetv2_m_ccd/6_1/35/detection_results/detection_results_epoch-1_20260506_163316.json"
     
     # 设置 IoU 阈值
     IOU_THRESHOLD = 0.5

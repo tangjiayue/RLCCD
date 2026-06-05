@@ -49,14 +49,10 @@ class DFINE(nn.Module):
         outputs= self.VisualClassifier(x, outputs, targets)
 
         return outputs, x
-
-    @torch.no_grad()
-    def predict_refine(self, feats, post_results, w=0.5):
-        return self.VisualClassifier.predict_refine(feats, post_results, w)
     
 
-    def get_losses(self, outputs, ref_cls_outputs=None):
-        return self.VisualClassifier.get_losses(outputs, ref_cls_outputs=ref_cls_outputs)
+    def get_losses(self, outputs, ref_cls_outputs=None, old_cls_outputs=None):
+        return self.VisualClassifier.get_losses(outputs, ref_cls_outputs=ref_cls_outputs, old_cls_outputs=old_cls_outputs)
 
     def deploy(
         self,

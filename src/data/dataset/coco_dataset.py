@@ -11,6 +11,7 @@ import torch
 import torchvision
 import os
 from PIL import Image
+import random
 
 from ...core import register
 from .._misc import convert_to_tv_tensor
@@ -30,7 +31,10 @@ class CocoDetection(FasterCocoDetection, DetDataset):
     __share__ = ["remap_mscoco_category"]
 
     def __init__(
-        self, img_folder, ann_file, transforms, return_masks=False, remap_mscoco_category=False
+        self, img_folder, ann_file, transforms, return_masks=False, remap_mscoco_category=False,
+        # # ← 新增参数
+        # oversample_categories=None,  # 要过采样的类别ID列表，如 [1, 2, 3]
+        # oversample_ratio=2.0,        # 过采样倍率
     ):
         super(FasterCocoDetection, self).__init__(img_folder, ann_file)
         self._transforms = transforms
@@ -40,11 +44,77 @@ class CocoDetection(FasterCocoDetection, DetDataset):
         self.return_masks = return_masks
         self.remap_mscoco_category = remap_mscoco_category
 
-    def __getitem__(self, idx):
+        # # ← 新增初始化
+        # self.oversample_categories = oversample_categories or []
+        # self.oversample_ratio = oversample_ratio
+
+        # # 计算采样权重
+        # if self.oversample_categories:
+        #     self._init_oversampling()
+        #     print(f"[Oversample] Initialized with ratio {self.oversample_ratio}")
+        # else:
+        #     self.sample_weights = None
+
+    # def _init_oversampling(self):
+    #     """初始化过采样权重"""
+    #     self.sample_weights = torch.ones(len(self.ids))
+        
+    #     for idx in range(len(self.ids)):
+    #         image_id = self.ids[idx]
+    #         ann_ids = self.coco.getAnnIds(imgIds=image_id)
+    #         anns = self.coco.loadAnns(ann_ids)
+    #         categories = set(ann["category_id"] for ann in anns)
+            
+    #         if any(cat in self.oversample_categories for cat in categories):
+    #             self.sample_weights[idx] = self.oversample_ratio
+
+    def __getitem__(self, idx):  
+        # 原有的加载逻辑
         img, target = self.load_item(idx)
         if self._transforms is not None:
             img, target, _ = self._transforms(img, target, self)
         return img, target
+
+    # #有放回的采样策略
+    # def __getitem__(self, idx):
+    #     # 过采样：根据权重重采样
+    #     if self.sample_weights is not None:
+    #         idx = torch.multinomial(self.sample_weights, 1).item()
+        
+    #     # 加载图像和标注（使用父类方法，它会返回正确的格式）
+    #     img, target = super(FasterCocoDetection, self).__getitem__(idx)
+        
+    #     # 构建目标字典
+    #     image_id = self.ids[idx]
+    #     image_path = os.path.join(self.img_folder, self.coco.loadImgs(image_id)[0]["file_name"])
+    #     target = {"image_id": image_id, "image_path": image_path, "annotations": target}
+        
+    #     # 应用 prepare (ConvertCocoPolysToMask)
+    #     if self.remap_mscoco_category:
+    #         img, target = self.prepare(img, target, category2label=mscoco_category2label)
+    #     else:
+    #         img, target = self.prepare(img, target)
+        
+    #     target["idx"] = torch.tensor([idx])
+        
+    #     # 转换 boxes 和 masks 格式
+    #     if "boxes" in target:
+    #         target["boxes"] = convert_to_tv_tensor(
+    #             target["boxes"], key="boxes", spatial_size=img.size[::-1]
+    #         )
+        
+    #     if "masks" in target:
+    #         target["masks"] = convert_to_tv_tensor(target["masks"], key="masks")
+        
+    #     # 应用 transforms
+    #     if self._transforms is not None:
+    #         img, target, _ = self._transforms(img, target, self)
+        
+    #     return img, target
+    
+    # def __len__(self):
+    #     """返回过采样后的数据集大小"""
+    #     return len(self.ids)
 
     def load_item(self, idx):
         image, target = super(FasterCocoDetection, self).__getitem__(idx)

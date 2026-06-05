@@ -249,7 +249,7 @@ class DetSolver(BaseSolver):
             "epoch": -1,
         }
         if self.last_epoch > 0:
-            module = self.ema.module if self.ema else self.model
+            module = self.ema if self.ema else self.model
             test_stats, coco_evaluator = evaluate(
                 module,
                 self.criterion,
@@ -267,6 +267,8 @@ class DetSolver(BaseSolver):
                 top1 = test_stats[k][0]
                 print(f"best_stat: {best_stat}")
 
+        # load_visual_classifier_from_model2(self.model, "/root/userfolder/Projects/RLCCD/output/dfine_hgnetv2_m_ccd/6_1/34/best_stg1.pth", device=self.device)
+
         if args.yaml_cfg["grpo_finetune"]:
             print("-" * 42 + "GRPO finetuning"+ "-" * 43)
             self.ref_module = copy.deepcopy(self.model.module)
@@ -279,20 +281,6 @@ class DetSolver(BaseSolver):
             #初始模型作为参考模型
             curr_vc = self.model.module.VisualClassifier if hasattr(self.model, "module") else self.model.VisualClassifier
             self.ref_vc = deepcopy(curr_vc)  # 直接拷贝整个 VC: vpe + cls_head + 其它子模块
-
-            ckpt_path = "/root/userfolder/Projects/RLCCD/output/dfine_hgnetv2_m_ccd/6_1/23/best_stg1.pth"
-            checkpoint = torch.load(ckpt_path, map_location="cpu")
-            state_dict = checkpoint.get("model", checkpoint)
-
-            # 只取 VisualClassifier.*，并去掉前缀以匹配 ref_vc 的 key（vpe.xxx / cls_head.xxx / ...）
-            new_state_dict = {}
-            prefix = "VisualClassifier."
-            for k, v in state_dict.items():
-                if k.startswith(prefix):
-                    new_state_dict[k[len(prefix):]] = v
-
-            msg = self.ref_vc.load_state_dict(new_state_dict, strict=False)
-            print(f"Ref VC Load Status: {msg}")
 
             self.ref_vc.eval()
             for p in self.ref_vc.parameters():
@@ -317,6 +305,9 @@ class DetSolver(BaseSolver):
                     self.ema.decay = self.train_dataloader.collate_fn.ema_restart_decay
                     print(f"Refresh EMA at epoch {epoch} with decay {self.ema.decay}")
 
+            old_model = self.ema if self.ema else self.model
+            old_vc = self.model.module.VisualClassifier if hasattr(old_model, "module") else self.model.VisualClassifier
+            old_module = deepcopy(old_vc)
             train_stats = train_one_epoch(
                 self.model,
                 self.criterion,
@@ -336,7 +327,8 @@ class DetSolver(BaseSolver):
                 postprocessor=self.postprocessor,
                 ref_module=self.ref_module,
                 cfg=self.cfg,
-                ref_vc=self.ref_vc
+                ref_vc=self.ref_vc,
+                old_module=old_module,
             )
 
             if self.lr_warmup_scheduler is None or self.lr_warmup_scheduler.finished():
@@ -354,7 +346,7 @@ class DetSolver(BaseSolver):
                 for checkpoint_path in checkpoint_paths:
                     dist_utils.save_on_master(self.state_dict(), checkpoint_path)
 
-            module = self.ema.module if self.ema else self.model
+            module = self.ema if self.ema else self.model
             test_stats, coco_evaluator = evaluate(
                 module,
                 self.criterion,
@@ -459,7 +451,8 @@ class DetSolver(BaseSolver):
     def val(self):
         self.eval()
 
-        module = self.ema.module if self.ema else self.model
+        # load_visual_classifier_from_model2(self.model, "/root/userfolder/Projects/RLCCD/output/dfine_hgnetv2_m_ccd/6_1/35/best_stg1.pth", device=self.device)
+        module = self.ema if self.ema else self.model
         test_stats, coco_evaluator = evaluate(
             module,
             self.criterion,
@@ -502,3 +495,44 @@ def unwrap_model(model):
     if hasattr(model, "module"):
         return model.module
     return model
+
+
+def load_visual_classifier_from_model2(model, model2_path, device='cuda'):
+    """
+    从模型2加载 VisualClassifier 权重到现有模型
+    
+    Args:
+        model: 已经加载了模型1权重的模型实例
+        model2_path: 模型2的权重文件路径
+        device: 设备
+    
+    Returns:
+        model: 更新了 VisualClassifier 权重的模型
+    """
+    # 获取当前模型的 VisualClassifier
+    curr_model = model.module if hasattr(model, 'module') else model
+    curr_vc = curr_model.VisualClassifier
+    
+    # 加载模型2的权重
+    checkpoint = torch.load(model2_path, map_location=device)
+    state_dict = checkpoint.get("model", checkpoint)
+    
+    # 提取并去除 VisualClassifier 前缀
+    new_state_dict = {}
+    prefix = "VisualClassifier."
+    prefix_len = len(prefix)
+    
+    for k, v in state_dict.items():
+        if k.startswith(prefix):
+            # 去除 'VisualClassifier.' 前缀
+            new_k = k[prefix_len:]
+            new_state_dict[new_k] = v
+    
+    # 加载到 VisualClassifier（strict=False 允许缺失键）
+    msg = curr_vc.load_state_dict(new_state_dict, strict=False)
+    
+    print(f"VisualClassifier Load Status: {msg}")
+    print(f"Loaded {len(new_state_dict)} parameters from model2")
+    
+    return model
+ 

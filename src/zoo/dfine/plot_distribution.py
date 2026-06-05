@@ -1,10 +1,12 @@
 import torch
+from collections import defaultdict
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
 from sklearn.manifold import TSNE
 from sklearn.metrics import confusion_matrix
 import os
+import json
 
 # 假设你的10个类别名称是这些（请按你的实际TCT类别修改）
 CLASS_NAMES = ['Normal0', 'ASC-US1', 'ASC-H2', 'LSIL3', 'HSIL/SCC4', 'AGC5', 'VAG6', 'MON7', 'DYS8', 'EC9']
@@ -18,13 +20,26 @@ class FeatureAccumulator:
         self.all_feats = []
         self.all_labels = []
         self.all_preds = []
+        self.all_confidences = []  # 存储每个样本的预测置信度
+        self.all_logits = []       # 存储所有类别的logits（用于获取所有类别的置信度）
         
-    def update(self, feats, true_labels, pred_labels=None):
-        # 立即转移到 CPU 测试，防止撑爆显卡
+    def update(self, feats, true_labels, pred_labels=None, all_logits=None):
+        """
+        更新收集器
+        Args:
+            feats: 特征向量
+            true_labels: 真实标签
+            pred_labels: 预测标签（可选）
+        """
         self.all_feats.append(feats.detach().cpu())
         self.all_labels.append(true_labels.detach().cpu())
         if pred_labels is not None:
             self.all_preds.append(pred_labels.detach().cpu())
+        if all_logits is not None:
+            self.all_logits.append(all_logits.detach().cpu())
+            # 从 logits 计算置信度
+            conf = torch.sigmoid(all_logits.float()).max(dim=-1)[0]  # 或 softmax
+            self.all_confidences.append(conf.detach().cpu())
             
     def plot_and_clear(self, save_dir, epoch=0):
         if len(self.all_feats) == 0:
@@ -57,8 +72,114 @@ class FeatureAccumulator:
             preds_cat = torch.cat(self.all_preds, dim=0).numpy()
             cm_path = os.path.join(save_dir, f"epoch_{epoch}_confusion_matrix.png")
             plot_confusion_matrix_heatmap(labels_cat, preds_cat, cm_path)
-            
+        
+        # ========== 保存错误样本统计文件 ==========
+        if len(self.all_preds) > 0 and len(self.all_logits) > 0:
+            self._save_error_statistics(save_dir, epoch)
+
         self.reset() # 画完图后清空，为下一个 Epoch 腾出空间
+
+    def _save_error_statistics(self, save_dir, epoch):
+        """
+        保存错误样本的详细统计信息
+        """
+        print(f"正在生成错误样本统计文件...")
+        
+        # 拼接所有数据
+        labels_cat = torch.cat(self.all_labels, dim=0).numpy()
+        preds_cat = torch.cat(self.all_preds, dim=0).numpy()
+        
+        # 获取置信度（如果有）
+        if len(self.all_confidences) > 0:
+            confs_cat = torch.cat(self.all_confidences, dim=0).numpy()
+        else:
+            # 如果没有单独存储置信度，从 logits 计算（假设取最大值的 sigmoid）
+            logits_cat = torch.cat(self.all_logits, dim=0).numpy()
+            confs_cat = 1 / (1 + np.exp(-logits_cat.max(axis=1)))  # softmax 后的最大概率
+        
+        # 获取所有类别的 logits（转为概率）
+        logits_cat = torch.cat(self.all_logits, dim=0)
+        if logits_cat.dtype == torch.float16:
+            logits_cat = logits_cat.float()
+        logits_cat = logits_cat.numpy()
+        probs_cat = torch.sigmoid(torch.tensor(logits_cat)).numpy()  # sigmoid 转概率
+        
+        # 找出错误样本
+        error_mask = (labels_cat != preds_cat)
+        error_indices = np.where(error_mask)[0]
+        
+        if len(error_indices) == 0:
+            print("没有错误样本，跳过统计文件生成。")
+            return
+        
+        # 按类别分组统计错误
+        error_by_class = defaultdict(list)
+        for idx in error_indices:
+            gt_class = int(labels_cat[idx])
+            pred_class = int(preds_cat[idx])
+            conf = float(confs_cat[idx])
+            
+            # 获取所有类别的概率
+            all_probs = probs_cat[idx].tolist()
+            all_probs_dict = {CLASS_NAMES[i]: round(all_probs[i], 4) for i in range(len(CLASS_NAMES))}
+            
+            error_info = {
+                "sample_index": int(idx),
+                "true_class": CLASS_NAMES[gt_class],
+                "true_class_id": gt_class,
+                "pred_class": CLASS_NAMES[pred_class],
+                "pred_class_id": pred_class,
+                "pred_confidence": round(conf, 4),
+                "all_class_probs": all_probs_dict,
+                "top3_误判候选": sorted(all_probs_dict.items(), key=lambda x: x[1], reverse=True)[:3]
+            }
+            error_by_class[gt_class].append(error_info)
+        
+        # 保存为 JSON 文件
+        json_path = os.path.join(save_dir, f"epoch_{epoch}_error_samples.json")
+        with open(json_path, 'w', encoding='utf-8') as f:
+            json.dump(dict(error_by_class), f, ensure_ascii=False, indent=2)
+        
+        # 同时生成可读的文本文件
+        txt_path = os.path.join(save_dir, f"epoch_{epoch}_error_report.txt")
+        with open(txt_path, 'w', encoding='utf-8') as f:
+            f.write("=" * 80 + "\n")
+            f.write(f"错误样本统计报告 - Epoch {epoch}\n")
+            f.write(f"总样本数: {len(labels_cat)}\n")
+            f.write(f"错误样本数: {len(error_indices)}\n")
+            f.write(f"错误率: {len(error_indices)/len(labels_cat):.2%}\n")
+            f.write("=" * 80 + "\n\n")
+            
+            for gt_class, errors in sorted(error_by_class.items()):
+                class_name = CLASS_NAMES[gt_class]
+                f.write(f"\n{'='*60}\n")
+                f.write(f"类别 {gt_class} - {class_name}\n")
+                f.write(f"错误样本数: {len(errors)}\n")
+                f.write(f"{'='*60}\n\n")
+                
+                for err in errors[:20]:  # 每类最多显示20个
+                    f.write(f"  [样本 {err['sample_index']}]\n")
+                    f.write(f"    真实类别: {err['true_class']}\n")
+                    f.write(f"    预测类别: {err['pred_class']} (置信度: {err['pred_confidence']})\n")
+                    f.write(f"    所有类别置信度:\n")
+                    for cls, prob in err['all_class_probs'].items():
+                        f.write(f"      {cls}: {prob:.4f}\n")
+                    f.write(f"    Top-3 误判候选: {err['top3_误判候选']}\n")
+                    f.write("\n")
+        
+        print(f"错误样本统计已保存至: {json_path}")
+        print(f"错误报告已保存至: {txt_path}")
+        
+        # 打印摘要
+        print(f"\n========== Epoch {epoch} 错误摘要 ==========")
+        print(f"总错误率: {len(error_indices)/len(labels_cat):.2%}")
+        for gt_class, errors in sorted(error_by_class.items()):
+            class_name = CLASS_NAMES[gt_class]
+            # 计算该类别的样本总数
+            class_total = (labels_cat == gt_class).sum()
+            class_error_rate = len(errors) / class_total if class_total > 0 else 0
+            print(f"{class_name}({gt_class}): 错误 {len(errors)}/{class_total} ({class_error_rate:.2%})")
+        print("=" * 40 + "\n")
 
 # 实例化一个全局对象供 VPE 随时导入调用
 epoch_visualizer = FeatureAccumulator()

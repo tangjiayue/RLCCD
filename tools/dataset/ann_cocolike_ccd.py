@@ -23,12 +23,15 @@ def update_coco_file_names(input_json_path, output_json_path):
     with open(output_json_path, 'w') as f:
         json.dump(coco_data, f, indent=4)
 
-input_json_path = '/root/userfolder/Dataset/ObjectDetection/TCT_JPEGImages/train30000-cat10.json'
-output_json_path = '/root/userfolder/Dataset/ObjectDetection/TCT_JPEGImages/train30000-cocolike-cat10.json'
+# input_json_path = '/root/userfolder/Dataset/ObjectDetection/TCT_JPEGImages/train30000-cat10.json'
+# output_json_path = '/root/userfolder/Dataset/ObjectDetection/TCT_JPEGImages/train30000-cocolike-cat10.json'
 
-update_coco_file_names(input_json_path, output_json_path)
+# update_coco_file_names(input_json_path, output_json_path)
 
-input_json_path = '/root/userfolder/Dataset/ObjectDetection/TCT_JPEGImages/val5000-cat10.json'
-output_json_path = '/root/userfolder/Dataset/ObjectDetection/TCT_JPEGImages/val5000-cocolike-cat10.json'
+# input_json_path = '/root/userfolder/Dataset/ObjectDetection/TCT_JPEGImages/val5000-cat10.json'
+# output_json_path = '/root/userfolder/Dataset/ObjectDetection/TCT_JPEGImages/val5000-cocolike-cat10.json'
+
+input_json_path = '/root/commonfile/TCT_JPEGImages/test10000-cat10.json'
+output_json_path = '/root/userfolder/Dataset/ObjectDetection/TCT_JPEGImages/test10000-cocolike-cat10.json'
 
 update_coco_file_names(input_json_path, output_json_path)

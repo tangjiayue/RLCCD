@@ -63,6 +63,7 @@ def train_one_epoch(
     ref_module = kwargs.get("ref_module", None)
     cfg = kwargs.get("cfg", None)
     ref_vc = kwargs.get("ref_vc", None)
+    old_module = kwargs.get("old_module", None)
 
     losses = []
 
@@ -81,7 +82,7 @@ def train_one_epoch(
 
         samples = samples.to(device)
         targets = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in targets]
-
+        
         if scaler is not None:
             with torch.autocast(device_type=str(device), cache_enabled=False):
                 outputs, outputs1= model(samples, targets=targets)
@@ -105,14 +106,11 @@ def train_one_epoch(
             else:
                 ref_outputs = None
 
+
             ref_cls_outputs = None
+            old_cls_outputs = None
             if cfg.grpo_cls:
-                ref_vc = kwargs.get("ref_vc", None)  # <- 从 train_one_epoch kwargs 取
-                if (
-                    ref_vc is not None
-                    and outputs1.get("grpo_boxes", None) is not None
-                    and outputs1.get("grpo_batch_idx", None) is not None
-                ):
+                if (outputs1.get("grpo_boxes", None) is not None and outputs1.get("grpo_batch_idx", None) is not None):
                     with torch.no_grad():
                         grpo_boxes = outputs1["grpo_boxes"]          # [Total_M*G, 4]
                         grpo_bidx = outputs1["grpo_batch_idx"]       # [Total_M*G]
@@ -131,6 +129,7 @@ def train_one_epoch(
                         max_n = int(counts.max().item()) if counts.numel() > 0 else 0
                         if max_n == 0:
                             ref_cls_outputs = None
+                            old_cls_outputs = None
                         else:
                             boxes_pad = grpo_boxes.new_zeros((B, max_n, 4))
                             mask_pad = torch.zeros((B, max_n), device=grpo_boxes.device, dtype=torch.bool)
@@ -144,22 +143,46 @@ def train_one_epoch(
                                 boxes_pad[bi, :n] = boxes_b
                                 mask_pad[bi, :n] = True
 
-                            # 旧 VPE + 旧分类头 输出 ref logits
-                            ref_vc = ref_vc.to(grpo_boxes.device)
-                            ref_vc.eval()
+                            if ref_vc is not None:
+                                with torch.no_grad():
+                                    # 旧 VPE + 旧分类头 输出 ref logits
+                                    ref_vc = ref_vc.to(grpo_boxes.device)
+                                    ref_vc.eval()
 
-                            ref_vpe_feats_padded = ref_vc.vpe(
-                                reference_boxes=boxes_pad,
-                                multi_scale_feats=ref_ms_feats,
-                            )  # [B, max_n, C]
-                            ref_box_feats = ref_vpe_feats_padded[mask_pad]  # [Total_M*G, C]
+                                    ref_vpe_feats_padded = ref_vc.vpe(
+                                        reference_boxes=boxes_pad,
+                                        multi_scale_feats=ref_ms_feats,
+                                    )  # [B, max_n, C]
+                                    if isinstance(ref_vpe_feats_padded, list):
+                                        ref_vpe_feats_padded = ref_vpe_feats_padded[-1]
+                                    ref_box_feats = ref_vpe_feats_padded[mask_pad.bool()]  # [Total_M*G, C]
 
-                            ref_logits_flat = ref_vc.cls_head(ref_box_feats)  # [Total_M*G, num_classes]
-                            ref_cls_outputs = ref_logits_flat.detach()
+                                    ref_logits_flat = ref_vc.cls_head(ref_box_feats)  # [Total_M*G, num_classes]
+                                    ref_cls_outputs = ref_logits_flat.detach()
+                            else:
+                                ref_cls_outputs = None
+
+                            if old_module is not None:
+                                with torch.no_grad():
+                                    # 旧 VPE + 旧分类头 输出 ref logits
+                                    old_module = old_module.to(grpo_boxes.device)
+                                    old_module.eval()
+
+                                    old_vpe_feats_padded = old_module.vpe(
+                                        reference_boxes=boxes_pad,
+                                        multi_scale_feats=ref_ms_feats,
+                                    )  # [B, max_n, C]
+                                    if isinstance(old_vpe_feats_padded, list):
+                                        old_vpe_feats_padded = old_vpe_feats_padded[-1]
+                                    old_box_feats = old_vpe_feats_padded[mask_pad.bool()]  # [Total_M*G, C]
+
+                                    old_logits_flat = old_module.cls_head(old_box_feats)  # [Total_M*G, num_classes]
+                                    old_cls_outputs = old_logits_flat.detach()
+                            else:
+                                old_cls_outputs = None
                 else:
                     ref_cls_outputs = None
-            else:
-                ref_cls_outputs = None
+                    old_cls_outputs = None
 
 
             if torch.isnan(outputs["pred_boxes"]).any() or torch.isinf(outputs["pred_boxes"]).any():
@@ -176,7 +199,8 @@ def train_one_epoch(
 
             with torch.autocast(device_type=str(device), enabled=False):
                 # loss_dict = criterion(outputs, targets, ref_outputs=ref_outputs, cfg=cfg, ref_cls_outputs=None,**metas)
-                loss_dict = model.module.get_losses(outputs1, ref_cls_outputs=ref_cls_outputs)
+
+                loss_dict = model.module.get_losses(outputs1, ref_cls_outputs=ref_cls_outputs, old_cls_outputs=old_cls_outputs)
                 # loss_dict.update(criterion(outputs, targets, ref_outputs=ref_outputs, cfg=cfg, ref_cls_outputs=None,**metas))
                 
                 # loss_dict2 = criterion(outputs1["outputs"], targets, ref_outputs=ref_outputs, cfg=cfg, ref_cls_outputs=None,**metas)
@@ -185,11 +209,6 @@ def train_one_epoch(
             loss_raw = sum(loss_dict.values())
             loss = loss_raw / accum_steps 
 
-            # for name, param in model.module.VisualClassifier.vpe.named_parameters():
-            #     if param.grad is not None:
-            #         print(f"[GRAD] {name}: {param.grad.norm().item():.6f}")
-            #     else:
-            #         print(f"[GRAD] {name}: None")
             scaler.scale(loss).backward()   
 
             if (i + 1) % accum_steps == 0:
@@ -201,9 +220,7 @@ def train_one_epoch(
                 scaler.update()
                 optimizer.zero_grad()
             
-            del outputs, loss_raw, loss
-            # if ref_cls_outputs is not None:
-            #     del ref_cls_outputs
+            del outputs, loss_raw, loss, outputs1
 
         else:
             outputs, outputs1 = model(samples, targets=targets)
@@ -288,7 +305,7 @@ def train_one_epoch(
                 optimizer.step()
                 optimizer.zero_grad()
 
-            del outputs, loss_raw, loss
+            del outputs, loss_raw, loss, outputs1
 
         # #可视化GRPO采样情况
         # if "dec_out_grpo_bboxes" in outputs1 and outputs1["dec_out_grpo_bboxes"] is not None:
@@ -373,7 +390,6 @@ def evaluate(
     if use_wandb:
         import wandb
 
-    model.eval()
     criterion.eval()
     coco_evaluator.cleanup()
 
@@ -409,11 +425,9 @@ def evaluate(
         samples = samples.to(device)
         targets = [{k: v.to(device) if isinstance(v, torch.Tensor) else v for k, v in t.items()} for t in targets]
 
-        # TODO (lyuwenyu), fix dataset converted using `convert_to_coco_api`?
         orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
         outputs, feats = model.module.sample(samples, targets=targets)
         results = postprocessor(outputs, orig_target_sizes)
-        # results = model.module.predict_refine(feats, results, 1)
 
         # if m_output_dir is not None and dist_utils.is_main_process():          
         #     save_grpo_samples(
@@ -428,6 +442,7 @@ def evaluate(
         # ==================== 可视化推理结果 ====================
         # 只在主进程、前几个 batch、且可视化器已初始化时执行
         if dist_utils.is_main_process() and visualizer is not None and i < 2:  # 只可视化前 2 个 batch
+        # if dist_utils.is_main_process() and visualizer is not None:
             try:
                 save_dir = os.path.join(m_output_dir, "inference_vis", f"epoch_{epoch}")                
                 # 并排对比（需要 targets）
@@ -479,13 +494,14 @@ def evaluate(
             )
 
     #Conf matrix, F1, Precision, Recall, box IoU
-    metrics = Validator(gt, preds).compute_metrics()
+    metrics = Validator(gt, preds, conf_thresh=0).compute_metrics()
     print("Metrics:", metrics)
     if use_wandb:
         metrics = {f"metrics/{k}": v for k, v in metrics.items()}
         metrics["epoch"] = epoch
         wandb.log(metrics)
 
+    #=============自己计算mAP=======================
     # calculator = AdvancedMetricsCalculator(device=device)
     
     # # 执行计算 (内部自动处理分布式汇聚)
@@ -521,6 +537,7 @@ def evaluate(
     # if dist.is_initialized():
     #     dist.barrier()
 
+
     # # ===== TPR/FPR @ IoU=0.5（独立模块）=====
     # tprfpr = evaluate_tpr_fpr_from_gt_preds(
     #     gt=gt,
@@ -554,70 +571,68 @@ def evaluate(
 
     # accumulate predictions from all images
     if coco_evaluator is not None:
-        coco_evaluator.accumulate()
+        coco_evaluator.accumulate()      
         coco_evaluator.summarize()
 
-    if coco_evaluator is not None and dist_utils.is_main_process():
-        # 获取 bbox 评估结果对象
-        stats_obj = coco_evaluator.coco_eval["bbox"]
+        stats_obj = coco_evaluator.coco_eval["bbox"]    # 获取 bbox 评估结果对象
         cat_ids = stats_obj.params.catIds
-        
-        # precision 矩阵维度: [IoU阈值, Recall阈值, 类别, 面积范围, 最大检测数]
-        # IoU阈值 0-9 对应 0.50:0.95
-        # 面积范围 0 对应 'all'
         precision = stats_obj.eval['precision']
 
         # 用于计算排除 label 0 后的平均值
         valid_aps_50_95 = []
         valid_aps_50 = []
-        
-        print("\n" + "="*50)
-        print(f"{'CatID':<10} | {'AP@50:95':<12} | {'AP@50':<10}")
-        print("-" * 50)
-        
         for i, cat_id in enumerate(cat_ids):
-            # 计算该类在 0.50:0.95 上的平均 AP
-            # 我们对前两个维度（IoU 和 Recall）求平均
             ap_50_95 = precision[:, :, i, 0, -1].mean()
-            
-            # 计算该类在 0.50 阈值下的 AP (IoU 维度的索引 0)
             ap_50 = precision[0, :, i, 0, -1].mean()
             
-            print(f"{cat_id:<10} | {ap_50_95:<12.4f} | {ap_50:<10.4f}")
-
-            #排除 label 0 ---
-            if cat_id != 0:
+            if cat_id != 0:  # 排除类别0
                 valid_aps_50_95.append(ap_50_95)
                 valid_aps_50.append(ap_50)
-        
-        print("="*50 + "\n")
 
-        # 计算并打印排除 label 0 后的平均值 (mAP)
+        # 计算排除类别0后的 mAP（所有进程都计算）
         if len(valid_aps_50_95) > 0:
             mean_ap_50_95 = sum(valid_aps_50_95) / len(valid_aps_50_95)
             mean_ap_50 = sum(valid_aps_50) / len(valid_aps_50)
-            
-            print(f"{'mAP(excl.0)':<10} | {mean_ap_50_95:<12.4f} | {mean_ap_50:<10.4f}")
         else:
-            print("No labels other than 0 found.")
-            
-        print("="*50 + "\n")
+            mean_ap_50_95 = 0.0
+            mean_ap_50 = 0.0
 
-    # 保存检测结果
-    if dist_utils.is_main_process():
-        # 保存为JSON格式
-        json_path = dist_utils.save_detection_results(
-            gt=gt,
-            preds=preds,
-            save_dir= str(m_output_dir) +"/detection_results",
-            epoch=epoch,
-        )
+        if dist_utils.is_main_process():
+            print("\n" + "="*50)
+            print(f"{'CatID':<10} | {'AP@50:95':<12} | {'AP@50':<10}")
+            print("-" * 50)
+            
+            for i, cat_id in enumerate(cat_ids):
+                ap_50_95 = precision[:, :, i, 0, -1].mean()
+                ap_50 = precision[0, :, i, 0, -1].mean()
+                print(f"{cat_id:<10} | {ap_50_95:<12.4f} | {ap_50:<10.4f}")
+            
+            print("="*50)
+            print(f"{'mAP(excl.0)':<10} | {mean_ap_50_95:<12.4f} | {mean_ap_50:<10.4f}")
+            print("="*50 + "\n")
+
+    # # 保存检测结果
+    # if dist_utils.is_dist_available_and_initialized():
+    #     # 收集所有rank的gt和preds
+    #     all_gt = gather_all_ranks_data(gt)
+    #     all_preds = gather_all_ranks_data(preds)
+        
+    #     if dist_utils.is_main_process():
+    #         # 只有主进程保存汇总结果
+    #         json_path = dist_utils.save_detection_results(
+    #             gt=all_gt,
+    #             preds=all_preds,
+    #             save_dir=str(m_output_dir) + "/detection_results",
+    #             epoch=epoch,
+    #         )
 
     stats = {}
     # stats = {k: meter.global_avg for k, meter in metric_logger.meters.items()}
     if coco_evaluator is not None:
         if "bbox" in iou_types:
-            stats["coco_eval_bbox"] = coco_evaluator.coco_eval["bbox"].stats.tolist()
+            stats["bbox_mean_ap_50"] = [mean_ap_50]
+
+            # stats["coco_eval_bbox"] = coco_evaluator.coco_eval["bbox"].stats.tolist()
         if "segm" in iou_types:
             stats["coco_eval_masks"] = coco_evaluator.coco_eval["segm"].stats.tolist()
 
@@ -639,6 +654,29 @@ def evaluate(
     # ======================================================================================
 
     return stats, coco_evaluator
+
+def gather_all_ranks_data(data_list):
+    """收集所有rank的数据到主进程（支持任意Python对象）"""
+    if not dist.is_initialized():
+        return data_list
+    
+    world_size = dist.get_world_size()
+    rank = dist.get_rank()
+    
+    # 创建存储所有rank数据的列表
+    gathered_data = [None] * world_size
+    
+    # 使用 all_gather_object 收集所有数据
+    dist.all_gather_object(gathered_data, data_list)
+    
+    # 展平所有数据
+    if rank == 0:
+        all_data = []
+        for r_data in gathered_data:
+            all_data.extend(r_data)
+        return all_data
+    else:
+        return None
 
 def freeze_for_vpe_and_cls(model):
     # 递归获取原始模型
@@ -680,3 +718,4 @@ def unwrap_model(model):
     if hasattr(model, "module"):
         return model.module
     return model
+    

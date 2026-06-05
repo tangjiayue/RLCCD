@@ -36,18 +36,40 @@ class DFINEPostProcessor(nn.Module):
         return f"use_focal_loss={self.use_focal_loss}, num_classes={self.num_classes}, num_top_queries={self.num_top_queries}"
 
     def forward(self, outputs, orig_target_sizes: torch.Tensor):
-        logits, boxes = outputs["pred_logits"], outputs["pred_boxes"]
+        # logits, boxes = outputs["pred_logits"], outputs["pred_boxes"]
+        # vpe_logits = outputs["vpe_logits"]
+        logits, boxes = outputs["vpe_logits"], outputs["pred_boxes"]
+
+        # original_scores, _ = torch.sigmoid(logits).max(dim=-1) # [B, 300]
+        # replacement_mask = original_scores > 0.65 # [B, 300]
+        # logits = torch.where(replacement_mask.unsqueeze(-1), vpe_logits, logits)
+        
         quality_scores_raw = outputs["quality_score"]
 
         bbox_pred = torchvision.ops.box_convert(boxes, in_fmt="cxcywh", out_fmt="xyxy")
         bbox_pred *= orig_target_sizes.repeat(1, 2).unsqueeze(1)
 
+        # fusion_weights = torch.tensor([
+        #     0.2,  # 0: normal (原始更好)
+        #     0.3,  # 1: ascus
+        #     0.7,  # 2: asch (弱类别，提高)
+        #     0.7,  # 3: lsil (弱类别，提高)
+        #     0.3,  # 4: hsil
+        #     0.3,  # 5: agc
+        #     0.7,  # 6: vaginalis (弱类别)
+        #     0.8,  # 7: monilia (样本少，最高)
+        #     0.3,  # 8: dys
+        #     0.3,  # 9: ec
+        # ]).to(boxes.device)
         if self.use_focal_loss:
             scores = torch.sigmoid(logits)
+
+            # scores = (1-fusion_weights) * scores + fusion_weights*torch.sigmoid(outputs["pred_logits"])
+            # scores = 0.25 * torch.sigmoid(vpe_logits) + 0.75*torch.sigmoid(outputs["pred_logits"])
         else:
             scores = F.softmax(logits, dim=-1)
 
-        # --- 在 TopK 之前进行 NMS ---
+        # ========== 在 TopK 之前进行 NMS =============
         processed_logits = logits.clone()
         for i in range(logits.shape[0]):
             # 拿到当前图的预测
@@ -69,6 +91,7 @@ class DFINEPostProcessor(nn.Module):
             
             # if len(cur_boxes) == 0:
             #     continue
+
             
             # 执行 Batched NMS (同类抑制)
             # 因为已经是像素坐标，这里的 0.5 阈值会非常准确
@@ -85,7 +108,7 @@ class DFINEPostProcessor(nn.Module):
             scores = torch.sigmoid(logits)
         else:
             scores = F.softmax(logits, dim=-1)
-        # --- NMS 结束 ---
+        # ============ NMS 结束 =========================
 
         if self.use_focal_loss:
             # scores = F.sigmoid(logits)
@@ -108,6 +131,7 @@ class DFINEPostProcessor(nn.Module):
             if scores.shape[1] > self.num_top_queries:
                 scores, query_index = torch.topk(scores, self.num_top_queries, dim=-1)
                 labels = torch.gather(labels, dim=1, index=query_index)  
+                
                 boxes_scaled = torch.gather(
                     bbox_pred, dim=1, index=query_index.unsqueeze(-1).tile(1, 1, bbox_pred.shape[-1])
                 )
@@ -145,40 +169,11 @@ class DFINEPostProcessor(nn.Module):
         #     results.append(result)
 
         return results
-
+   
     def deploy(
         self,
     ):
         self.eval()
         self.deploy_mode = True
         return self
-
-def expert_calibration(scores, class_configs):
-    """
-    scores: [N, num_classes] 原始得分
-    class_configs: 每一类的映射字典 {class_id: (x_nodes, y_nodes)}
-    """
-    calibrated_scores = scores.clone()
-    
-    for cid, (x_nodes, y_nodes) in class_configs.items():
-        # 获取该列分数
-        s = scores[:, cid]
-        
-        # 构造分段线性映射
-        # 原理：利用 torch.bucketize 找到区间，再进行线性内插
-        # 这里为了演示清晰使用逻辑掩码，实际大规模部署建议用 interp 函数
-        new_s = torch.zeros_like(s)
-        for i in range(len(x_nodes) - 1):
-            mask = (s >= x_nodes[i]) & (s < x_nodes[i+1])
-            if mask.any():
-                # 线性插值公式: y = y0 + (x - x0) * (y1 - y0) / (x1 - x0)
-                slope = (y_nodes[i+1] - y_nodes[i]) / (x_nodes[i+1] - x_nodes[i])
-                new_s[mask] = y_nodes[i] + slope * (s[mask] - x_nodes[i])
-        
-        # 处理边界 1.0
-        new_s[s >= x_nodes[-1]] = y_nodes[-1]
-        calibrated_scores[:, cid] = new_s
-        
-    return calibrated_scores
-
 

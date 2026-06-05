@@ -6,7 +6,7 @@ __include__: [
   './include/dfine_hgnetv2.yml',
 ]
 
-output_dir: output/dfine_hgnetv2_m_ccd/6_1/35
+output_dir: output/dfine_hgnetv2_m_ccd/6_1/38
 
 
 DFINE:
@@ -34,37 +34,7 @@ optimizer:
     -
       # 捕获 VisualClassifier 下的所有参数，不论是普通权重还是 BN
       params: '^(?=.*VisualClassifier).*$'
-      lr: 0.00001
-      weight_decay: 0.
-    # - 
-    #   params: '^(?=.*VisualClassifier)(?=.*(cross_attn|self_attn|ffn)).*$'
-    #   lr: 0.00001
-    #   weight_decay: 0.0001  
-    # - 
-    #   params: '^(?=.*VisualClassifier)(?=.*visual_bbox_encoding).*$'
-    #   lr: 0.000002
-    #   weight_decay: 0.0001 
-    # - 
-    #   params: '^(?=.*VisualClassifier)(?=.*freq_enhancer).*$'
-    #   lr: 0.000001
-    #   weight_decay: 0.0001
-    # - 
-    #   params: '^(?=.*VisualClassifier)(?=.*texture_).*$'
-    #   lr: 0.00002
-    #   weight_decay: 0.0001 
-    # - 
-    #   params: '^(?=.*VisualClassifier)(?=.*cls_head).*$'
-    #   lr: 0.0001
-    #   weight_decay: 0.0001
-    # - 
-    #   params: '^(?=.*VisualClassifier)(?=.*norm).*$'
-    #   lr: 0.0001
-    #   weight_decay: 0.
-    #   # 捕获 VisualClassifier 下的所有参数，不论是普通权重还是 BN
-    # - 
-    #   params: '^(?=.*VisualClassifier)(?!.*(cross_attn|self_attn|ffn|visual_bbox_encoding|freq_enhancer|texture_|cls_head|norm)).*$'
-    #   lr: 0.00001
-    #   weight_decay: 0.
+      lr: 0.00002
     -
       params: '^(?=.*backbone)(?!.*norm|bn).*$'
       # lr: 0.00002
@@ -101,7 +71,7 @@ print_freq: 100
 
 pretrain_vpe: False
 
-grpo_cls: False
+grpo_cls: True
 grpo_finetune: False
 grpo_advantage_weight: 0.01
 grpo_beta: 0.04

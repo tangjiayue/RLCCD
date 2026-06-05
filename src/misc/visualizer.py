@@ -382,6 +382,30 @@ class InferenceVisualizer:
         
         return img_copy
     
+    # #创建对比图：左侧预测框，右侧GT框
+    # def create_comparison_image_pil(
+    #     self,
+    #     image: Image.Image,
+    #     pred_boxes: np.ndarray,
+    #     pred_scores: np.ndarray,
+    #     pred_labels: np.ndarray,
+    #     gt_boxes: Optional[np.ndarray] = None,
+    #     gt_labels: Optional[np.ndarray] = None,
+    # ) -> Image.Image:
+    #     """创建对比图：左侧预测框，右侧GT框"""
+    #     w, h = image.size
+        
+    #     left_img = self.draw_pred_boxes_pil(image.copy(), pred_boxes, pred_scores, pred_labels)
+        
+    #     if gt_boxes is not None:
+    #         right_img = self.draw_gt_boxes_pil(image.copy(), gt_boxes, gt_labels)
+    #         comparison = Image.new('RGB', (w * 2, h))
+    #         comparison.paste(left_img, (0, 0))
+    #         comparison.paste(right_img, (w, 0))
+    #         return comparison
+    #     else:
+    #         return left_img
+    
     def create_comparison_image_pil(
         self,
         image: Image.Image,
@@ -390,21 +414,223 @@ class InferenceVisualizer:
         pred_labels: np.ndarray,
         gt_boxes: Optional[np.ndarray] = None,
         gt_labels: Optional[np.ndarray] = None,
+        iou_threshold: float = 0.5,
     ) -> Image.Image:
-        """创建对比图：左侧预测框，右侧GT框"""
+        """创建对比图：左侧预测框，右侧GT框，并在图上显示召回率和精确率"""
+
         w, h = image.size
-        
-        left_img = self.draw_pred_boxes_pil(image.copy(), pred_boxes, pred_scores, pred_labels)
-        
-        if gt_boxes is not None:
-            right_img = self.draw_gt_boxes_pil(image.copy(), gt_boxes, gt_labels)
-            comparison = Image.new('RGB', (w * 2, h))
-            comparison.paste(left_img, (0, 0))
-            comparison.paste(right_img, (w, 0))
-            return comparison
-        else:
+        # =========================
+        # 关键：先按置信度取 top_k（与画图一致）
+        # =========================
+        if len(pred_scores) > self.top_k:
+            idx = np.argsort(pred_scores)[::-1][:self.top_k]
+            pred_boxes = pred_boxes[idx]
+            pred_scores = pred_scores[idx]
+            pred_labels = pred_labels[idx]
+
+        # =========================
+        # 计算 Precision / Recall
+        # =========================
+        precision = 0.0
+        recall = 0.0
+        tp = fp = fn = 0
+
+        if gt_boxes is not None and len(gt_boxes) > 0 and len(pred_boxes) > 0:
+            
+            # 初始化匹配记录
+            gt_matched = [False] * len(gt_boxes)
+            pred_matched = [False] * len(pred_boxes)
+            
+            # 计算所有 IoU 矩阵
+            iou_matrix = np.zeros((len(pred_boxes), len(gt_boxes)))
+            for i, pred_box in enumerate(pred_boxes):
+                for j, gt_box in enumerate(gt_boxes):
+                    iou_matrix[i, j] = self._compute_iou(pred_box, gt_box)
+            
+            # 贪心匹配：按 IoU 从高到低排序
+            matches = []
+            for i in range(len(pred_boxes)):
+                for j in range(len(gt_boxes)):
+                    if iou_matrix[i, j] >= iou_threshold:
+                        matches.append((iou_matrix[i, j], i, j))
+            
+            # 按 IoU 降序排序
+            matches.sort(key=lambda x: x[0], reverse=True)
+            
+            # 执行匹配
+            for _, pred_idx, gt_idx in matches:
+                if not pred_matched[pred_idx] and not gt_matched[gt_idx]:
+                    pred_matched[pred_idx] = True
+                    gt_matched[gt_idx] = True
+            
+            tp = sum(pred_matched)
+            fp = len(pred_boxes) - tp
+            fn = len(gt_boxes) - sum(gt_matched)
+            
+            precision = tp / (tp + fp) if (tp + fp) > 0 else 0.0
+            recall = tp / (tp + fn) if (tp + fn) > 0 else 0.0
+            
+        elif gt_boxes is not None and len(gt_boxes) > 0 and len(pred_boxes) == 0:
+            # 没有预测框，但有待检目标
+            tp = 0
+            fp = 0
+            fn = len(gt_boxes)
+            precision = 0.0
+            recall = 0.0
+            
+        elif gt_boxes is not None and len(gt_boxes) == 0 and len(pred_boxes) > 0:
+            # 有预测框，但无待检目标
+            tp = 0
+            fp = len(pred_boxes)
+            fn = 0
+            precision = 0.0
+            recall = 0.0
+
+        # =========================
+        # 左图：预测
+        # =========================
+        left_img = self.draw_pred_boxes_pil(
+            image.copy(),
+            pred_boxes,
+            pred_scores,
+            pred_labels
+        )
+
+        # =========================
+        # 无GT直接返回
+        # =========================
+        if gt_boxes is None:
             return left_img
-    
+
+        # =========================
+        # 右图：GT
+        # =========================
+        right_img = self.draw_gt_boxes_pil(
+            image.copy(),
+            gt_boxes,
+            gt_labels
+        )
+
+        # 拼接左右图
+        comparison = Image.new("RGB", (w * 2, h))
+        comparison.paste(left_img, (0, 0))
+        comparison.paste(right_img, (w, 0))
+
+        draw = ImageDraw.Draw(comparison)
+
+        # =========================
+        # 字体
+        # =========================
+        try:
+            title_font = ImageFont.truetype(
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                18
+            )
+
+            metric_font = ImageFont.truetype(
+                "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+                16
+            )
+
+        except:
+            title_font = ImageFont.load_default()
+            metric_font = ImageFont.load_default()
+
+        # =========================
+        # 标题背景
+        # =========================
+        draw.rectangle((0, 0, 180, 30), fill=(0, 0, 0))
+        draw.rectangle((w, 0, w + 180, 30), fill=(0, 0, 0))
+
+        # 标题
+        draw.text(
+            (10, 5),
+            "Predictions",
+            fill=(255, 0, 0),   # 红色
+            font=title_font
+        )
+
+        draw.text(
+            (w + 10, 5),
+            "Ground Truth",
+            fill=(0, 255, 0),   # 绿色
+            font=title_font
+        )
+
+        # =========================
+        # 指标文字
+        # =========================
+        metric_text = (
+            f"Precision: {precision:.2%} | "
+            f"Recall: {recall:.2%} | "
+            f"TP:{tp} FP:{fp} FN:{fn}"
+        )
+
+        # 计算文字大小
+        bbox = draw.textbbox(
+            (0, 0),
+            metric_text,
+            font=metric_font
+        )
+
+        text_width = bbox[2] - bbox[0]
+        text_height = bbox[3] - bbox[1]
+
+        text_x = w * 2 - text_width - 15
+        text_y = 5
+
+        padding = 6
+
+        # =========================
+        # 黑色背景框
+        # =========================
+        draw.rectangle(
+            (
+                text_x - padding,
+                text_y - padding,
+                text_x + text_width + padding,
+                text_y + text_height + padding
+            ),
+            fill=(0, 0, 0)
+        )
+
+        # =========================
+        # 根据 Recall 动态颜色（召回率低更危险）
+        # =========================
+        if recall < 0.5:
+            metric_color = (255, 0, 0)       # 红（漏检严重）
+        elif recall < 0.8:
+            metric_color = (255, 165, 0)     # 橙
+        else:
+            metric_color = (0, 255, 0)       # 绿
+
+        # =========================
+        # 绘制指标文字
+        # =========================
+        draw.text(
+            (text_x, text_y),
+            metric_text,
+            fill=metric_color,
+            font=metric_font
+        )
+
+        return comparison
+
+
+    def _compute_iou(self, box1, box2):
+        """计算两个框的 IoU（输入 xyxy 格式）"""
+        x1 = max(box1[0], box2[0])
+        y1 = max(box1[1], box2[1])
+        x2 = min(box1[2], box2[2])
+        y2 = min(box1[3], box2[3])
+        
+        inter_area = max(0, x2 - x1) * max(0, y2 - y1)
+        box1_area = (box1[2] - box1[0]) * (box1[3] - box1[1])
+        box2_area = (box2[2] - box2[0]) * (box2[3] - box2[1])
+        union_area = box1_area + box2_area - inter_area
+        
+        return inter_area / (union_area + 1e-6)
+
     def visualize_batch(
         self,
         images: torch.Tensor,

@@ -444,7 +444,7 @@ class Validator:
                     if pred_label != gt_label:
                         self.analysis_label_errors += 1
                         # 方向统计
-                        if pred_label < gt_label: self.analysis_class_details[gt_label]["over"] += 1
+                        if pred_label > gt_label: self.analysis_class_details[gt_label]["over"] += 1
                         else: self.analysis_class_details[gt_label]["under"] += 1
                         
                         # 跨组统计 (0-4 vs 5-9)
@@ -506,16 +506,37 @@ class Validator:
         label_error_rate = self.analysis_label_errors / self.analysis_matched_loc if self.analysis_matched_loc > 0 else 0
         
         print("\n" + "=" * 25)
-        print("深度匹配分析 (基于 IoU 优先的一对一匹配)")
+        print(f"深度匹配分析 (基于 IoU 优先的一对一匹配,iou_thresh={self.iou_thresh})")
         print(f"1. 仅位置召回率 (Pure Loc Recall): {pure_loc_recall:.2%} ({self.analysis_matched_loc}/{self.analysis_total_gt})")
         print(f"2. 已匹配分类错误率(Label Error Rate): {label_error_rate:.2%} ({self.analysis_label_errors}个)")
         # print(f"3. 分支判定错误: Ordinal->Other: {self.analysis_mis_to_other} | Other->Ordinal: {self.analysis_mis_to_ordinal}")
-        print("-" * 50)
-        print(f"{'Class':>5} | {'Matched':>7} | {'Correct':>7} | {'Over':>5} | {'Under':>5}")
+        # print("-" * 50)
+        # print(f"{'Class':>5} | {'Matched':>7} | {'Correct':>7} | {'Over':>5} | {'Under':>5}")
+        # for c in sorted(self.analysis_class_details.keys()):
+        #     s = self.analysis_class_details[c]
+        #     print(f"{c:>5} | {s['matched']:>7} | {s['correct']:>7} | {s['over']:>5} | {s['under']:>5}")
+        # print("=" * 25 + "\n")
+        # ========== 每个类别的详细统计 ==========
+        print(f"{'Class':>8} | {'Matched':>8} | {'Correct':>8} | {'Acc/Err':>8} | {'Over':>6} | {'Under':>6}")
+        print("-" * 60)
+        
         for c in sorted(self.analysis_class_details.keys()):
             s = self.analysis_class_details[c]
-            print(f"{c:>5} | {s['matched']:>7} | {s['correct']:>7} | {s['over']:>5} | {s['under']:>5}")
-        print("=" * 25 + "\n")
+            matched = s['matched']
+            correct = s['correct']
+            
+            if matched > 0:
+                accuracy = correct / matched
+                error_rate = 1 - accuracy
+                acc_str = f"{accuracy:.2%}"
+                err_str = f"{error_rate:.2%}"
+                acc_err_display = f"{acc_str}/{err_str}"
+            else:
+                acc_err_display = "N/A"
+            
+            print(f"{c:>8} | {matched:>8} | {correct:>8} | {acc_err_display:>8} | {s['over']:>6} | {s['under']:>6}")
+        
+        print("=" * 60 + "\n")
 
     def save_plots(self, path_to_save) -> None:
         path_to_save = Path(path_to_save)

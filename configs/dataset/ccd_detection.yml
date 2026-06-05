@@ -12,9 +12,7 @@ train_dataloader:
   dataset:
     type: CocoDetection
     img_folder: /root/userfolder/Dataset/ObjectDetection/TCT_JPEGImages/train30000
-    ann_file: /root/userfolder/Dataset/ObjectDetection/TCT_JPEGImages/train30000-cocolike-cat10.json
-    # img_folder: /root/userfolder/Dataset/ObjectDetection/TCT_JPEGImages/train200
-    # ann_file: /root/userfolder/Dataset/ObjectDetection/TCT_JPEGImages/train200-cocolike-cat10.json
+    ann_file: /root/userfolder/Dataset/ObjectDetection/TCT_JPEGImages/annotations_clean/train30000-cocolike-cat10_clean.json
     return_masks: False
     transforms:
       type: Compose
@@ -31,9 +29,8 @@ val_dataloader:
   dataset:
     type: CocoDetection
     img_folder: /root/userfolder/Dataset/ObjectDetection/TCT_JPEGImages/val
-    ann_file: /root/userfolder/Dataset/ObjectDetection/TCT_JPEGImages/val5000-cocolike-cat10.json
-    # img_folder: /root/userfolder/Dataset/ObjectDetection/TCT_JPEGImages/train200
-    # ann_file: /root/userfolder/Dataset/ObjectDetection/TCT_JPEGImages/train200-cocolike-cat10.json
+    # ann_file: /root/userfolder/Dataset/ObjectDetection/TCT_JPEGImages/val5000-cocolike-cat10.json
+    ann_file: /root/userfolder/Dataset/ObjectDetection/TCT_JPEGImages/annotations_clean/val5000-cocolike-cat10_clean.json
     return_masks: False
     transforms:
       type: Compose

@@ -41,6 +41,40 @@ def box_iou(boxes1: Tensor, boxes2: Tensor):
     iou = inter / union
     return iou, union
 
+def box_iom(boxes1: Tensor, boxes2: Tensor):
+    """
+    Compute IoM (Intersection over Minimum) between two sets of boxes.
+    IoM = intersection / min(area1, area2)
+    
+    Args:
+        boxes1: (N, 4) tensor of bounding boxes [x1, y1, x2, y2]
+        boxes2: (M, 4) tensor of bounding boxes [x1, y1, x2, y2]
+    
+    Returns:
+        iom: (N, M) tensor of IoM values
+        min_area: (N, M) tensor of min(area1, area2)
+    """
+    area1 = box_area(boxes1)  # (N,)
+    area2 = box_area(boxes2)  # (M,)
+    
+    # 计算交集区域
+    lt = torch.max(boxes1[:, None, :2], boxes2[:, :2])  # [N, M, 2]
+    rb = torch.min(boxes1[:, None, 2:], boxes2[:, 2:])  # [N, M, 2]
+    
+    wh = (rb - lt).clamp(min=0)  # [N, M, 2]
+    inter = wh[:, :, 0] * wh[:, :, 1]  # [N, M]
+    
+    # 计算两者中的最小面积
+    # area1[:, None] 形状: (N, 1)
+    # area2 形状: (M,)
+    # 广播后得到 (N, M)
+    min_area = torch.min(area1[:, None], area2)
+    
+    # 计算 IoM，避免除零
+    iom = inter / (min_area + 1e-8)
+    
+    return iom, min_area
+
 def get_pairwise_iou(b1, b2):
     # 计算交集区域
     lt = torch.max(b1[..., :2], b2[..., :2]) # [Total_M, G, 2]

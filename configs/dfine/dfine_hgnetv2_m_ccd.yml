@@ -6,7 +6,7 @@ __include__: [
   './include/dfine_hgnetv2.yml',
 ]
 
-output_dir: output/dfine_hgnetv2_m_ccd/6_1/38
+output_dir: output/dfine_hgnetv2_m_ccd/6_1/40
 
 
 DFINE:
@@ -35,6 +35,7 @@ optimizer:
       # 捕获 VisualClassifier 下的所有参数，不论是普通权重还是 BN
       params: '^(?=.*VisualClassifier).*$'
       lr: 0.00002
+      # weight_decay: 0.0001
     -
       params: '^(?=.*backbone)(?!.*norm|bn).*$'
       # lr: 0.00002
@@ -48,7 +49,6 @@ optimizer:
       params: '^(?=.*(?:encoder|decoder))(?=.*(?:norm|bn|bias)).*$'
       weight_decay: 0.
 
-  # lr: 0.0002
   lr: 0.0002
   betas: [0.9, 0.999]
   weight_decay: 0.00012
@@ -56,7 +56,7 @@ optimizer:
 
 
 # epochs: 100 # Early stop
-epochs: 150
+epochs: 100
 train_dataloader:
   dataset:
     transforms:
@@ -70,8 +70,8 @@ checkpoint_freq: 2
 print_freq: 100
 
 pretrain_vpe: False
+grpo_cls: False
 
-grpo_cls: True
 grpo_finetune: False
 grpo_advantage_weight: 0.01
 grpo_beta: 0.04

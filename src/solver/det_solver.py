@@ -267,7 +267,7 @@ class DetSolver(BaseSolver):
                 top1 = test_stats[k][0]
                 print(f"best_stat: {best_stat}")
 
-        # load_visual_classifier_from_model2(self.model, "/root/userfolder/Projects/RLCCD/output/dfine_hgnetv2_m_ccd/6_1/34/best_stg1.pth", device=self.device)
+        # load_visual_classifier_from_model2(self.model, "/root/userfolder/Projects/RLCCD/output/dfine_hgnetv2_m_ccd/6_1/37/best_stg1.pth", device=self.device)
 
         if args.yaml_cfg["grpo_finetune"]:
             print("-" * 42 + "GRPO finetuning"+ "-" * 43)
@@ -276,19 +276,18 @@ class DetSolver(BaseSolver):
             self.ref_module = None
 
         if args.yaml_cfg.get("grpo_cls", False):
-            print("-" * 30 + " Initializing GRPO Reference VisualClassifier " + "-" * 30)
-
-            #初始模型作为参考模型
-            curr_vc = self.model.module.VisualClassifier if hasattr(self.model, "module") else self.model.VisualClassifier
-            self.ref_vc = deepcopy(curr_vc)  # 直接拷贝整个 VC: vpe + cls_head + 其它子模块
-
-            self.ref_vc.eval()
-            for p in self.ref_vc.parameters():
-                p.requires_grad = False
-
-            print("GRPO Reference VisualClassifier locked and loaded.")
+            print("-" * 30 + " Initializing GRPO Reference Model " + "-" * 30)
+            
+            curr_vc = self.model.module.VisualClassifier if hasattr(self.model, 'module') else self.model.VisualClassifier           
+            self.ref_cls = deepcopy(curr_vc)
+            
+            self.ref_cls.eval() # 必须是 eval 模式
+            for param in self.ref_cls.parameters():
+                param.requires_grad = False # 必须冻结
+            
+            print("GRPO Reference Model locked and loaded.")
         else:
-            self.ref_vc = None
+            self.ref_cls = None
 
         best_stat_print = best_stat.copy()
         start_time = time.time()
@@ -306,7 +305,7 @@ class DetSolver(BaseSolver):
                     print(f"Refresh EMA at epoch {epoch} with decay {self.ema.decay}")
 
             old_model = self.ema if self.ema else self.model
-            old_vc = self.model.module.VisualClassifier if hasattr(old_model, "module") else self.model.VisualClassifier
+            old_vc = old_model.module.VisualClassifier if hasattr(old_model, "module") else old_model.VisualClassifier
             old_module = deepcopy(old_vc)
             train_stats = train_one_epoch(
                 self.model,
@@ -327,14 +326,12 @@ class DetSolver(BaseSolver):
                 postprocessor=self.postprocessor,
                 ref_module=self.ref_module,
                 cfg=self.cfg,
-                ref_vc=self.ref_vc,
+                ref_cls=self.ref_cls,
                 old_module=old_module,
             )
 
             if self.lr_warmup_scheduler is None or self.lr_warmup_scheduler.finished():
                 self.lr_scheduler.step()
-                current_lr = self.optimizer.param_groups[0]['lr']
-                print(f"Epoch {epoch}: LR = {current_lr}")
 
             self.last_epoch += 1
 
@@ -451,7 +448,6 @@ class DetSolver(BaseSolver):
     def val(self):
         self.eval()
 
-        # load_visual_classifier_from_model2(self.model, "/root/userfolder/Projects/RLCCD/output/dfine_hgnetv2_m_ccd/6_1/35/best_stg1.pth", device=self.device)
         module = self.ema if self.ema else self.model
         test_stats, coco_evaluator = evaluate(
             module,
@@ -496,7 +492,6 @@ def unwrap_model(model):
         return model.module
     return model
 
-
 def load_visual_classifier_from_model2(model, model2_path, device='cuda'):
     """
     从模型2加载 VisualClassifier 权重到现有模型
@@ -535,4 +530,4 @@ def load_visual_classifier_from_model2(model, model2_path, device='cuda'):
     print(f"Loaded {len(new_state_dict)} parameters from model2")
     
     return model
- 
+    

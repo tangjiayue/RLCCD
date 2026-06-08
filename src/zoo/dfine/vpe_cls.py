@@ -13,7 +13,6 @@ from .box_ops import box_cxcywh_to_xyxy, box_xyxy_to_cxcywh, box_iou, generalize
 from ...misc.dist_utils import get_world_size, is_dist_available_and_initialized
 from .dfine_utils import distance2bbox, weighting_function
 from .utils import get_activation
-from .vpe import MMTREX
 
 __all__ = [
     "VisualClassifier",
@@ -67,10 +66,37 @@ class VisualClassifier(nn.Module):
         # 可学习的 Logit Scale (初始化为 1/0.1 ≈ 10，即 ln(10) ≈ 2.3)
         self.logit_scale = nn.Parameter(torch.ones([]) * 2.3026) 
 
+        # # ========== 自适应特征清创参数==========
+        # self.use_debridement=True                  # 是否启用
+        # self.debridement_xi_range=(0.001, 0.01)          # 扰动幅度范围
+        # self.debridement_sample_ratio=0.15          # 采样比例
+        # self.debridement_tau=0.1                  # 温度参数
+        # self.debridement_reinit_interval=9360        # 重新初始化分类层的间隔  478*20
+
+        # ========== 门控融合参数 (Gating Fusion) ==========
+        self.gate_proj = nn.Sequential(
+            nn.Linear(hidden_dim, hidden_dim // 2),
+            nn.GELU(),
+            nn.Linear(hidden_dim // 2, hidden_dim)
+        )
+
+        self.fusion_cls_head = ClassificationHead(hidden_dim, num_classes)
+
+        # ==================== 类别原型库 ====================
+        # 可学习或随机初始化的全局原型
+        self.register_buffer("class_prototypes", torch.randn(num_classes, hidden_dim))
+        nn.init.normal_(self.class_prototypes, std=0.02)
+        # 初始化时归一化
+        with torch.no_grad():
+            self.class_prototypes.copy_(F.normalize(self.class_prototypes, dim=-1))
+        # 动量更新系数
+        self.proto_momentum = 0.9
+
     def forward(self, feats, outputs, targets=None):
         #========开始
         pred_boxes = outputs['pred_boxes'] # [B, 300, 4] (cxcywh)
         quality_scores = outputs['quality_score'] # [B, 300, 1]
+        query_feats = outputs["output"] # [B, N, C] D-FINE 解码器输出的 query 特征
         device = pred_boxes.device
         B, N, _ = pred_boxes.shape
         
@@ -92,6 +118,14 @@ class VisualClassifier(nn.Module):
                 layer_logits = self.cls_head(layer_feats)
                 pred_vpe_feats = layer_feats
                 pred_vpe_logits = layer_logits
+
+                #生成投影向量 fr (全连接网络生成)
+                fr = self.gate_proj(query_feats) # [B, N, C]                
+                Gr = F.sigmoid(fr) # [B, N, C]
+
+                # 融合特征: query + weight * Gr * VPE
+                fusion_feats = query_feats + 0.5 * Gr * layer_feats
+                fusion_logits = self.fusion_cls_head(fusion_feats)
             else:
                 # 中间层使用辅助分类头
                 layer_logits = self.cls_head_aux(layer_feats)
@@ -99,7 +133,9 @@ class VisualClassifier(nn.Module):
             all_layer_logits.append(layer_logits)
        
         # # 融合质量分数作为最终匹配/预测的依据
-        refined_logits = pred_vpe_logits + quality_scores
+        # refined_logits = pred_vpe_logits + quality_scores
+        refined_logits = fusion_logits + quality_scores # 直接使用融合后的分数进行匹配和预测
+        refined_logits1 = pred_vpe_logits + quality_scores
 
         if self.training:
             # #===========================匈牙利匹配===========================
@@ -109,6 +145,14 @@ class VisualClassifier(nn.Module):
             # }
             # indices = self.matcher(outputs_for_matcher, targets)["indices"]
             
+            outputs_for_matcher = {
+                'pred_logits': fusion_logits + quality_scores, 
+                'pred_boxes': pred_boxes
+            }
+            fusion_indices = self.matcher(outputs_for_matcher, targets)["indices"]
+            outputs['fusion_logits'] = fusion_logits + quality_scores
+            outputs['fusion_feats'] = fusion_feats          # [B, N, C]
+
             #=====================iou匹配===========================
             # iou一对多匹配版本
             indices, neg_indices = rcnn_iou_match(
@@ -116,12 +160,6 @@ class VisualClassifier(nn.Module):
                 targets=targets,
                 pos_threshold=0.6,   
             )
-            # #iou一对一匹配版本
-            # indices, neg_indices = rcnn_iou_match_one_to_one(
-            #     pred_boxes=pred_boxes,
-            #     targets=targets,
-            #     pos_threshold=0.6,   
-            # )
 
             #=======================构造正样本的 Labels 和 IoUs===================
             flat_boxes_cxcywh = pred_boxes.reshape(-1, 4)
@@ -268,6 +306,43 @@ class VisualClassifier(nn.Module):
             #把对比学习的数据单独存一个字段
             adapted_text = self.text_adapter(self.class_text_feats)  # [num_cls, C]
             t_norm = F.normalize(adapted_text, dim=-1)
+
+            # #==============自适应特征清创================
+            # loss_debridement = torch.tensor(0.0, device=device)
+    
+            # if self.use_debridement and targets is not None:
+            #     # 采样并减少框特征
+            #     # result = self.sample_and_reduce_box_features(
+            #     #     pred_vpe_feats,   # [B, N, C]
+            #     #     pred_vpe_logits,  # [B, N, C]
+            #     #     quality_scores,
+            #     #     targets,
+            #     #     indices
+            #     # )
+            #     result = self.sample_and_reduce_box_features(
+            #         fusion_feats,   # [B, N, C]
+            #         fusion_logits,  # [B, N, C]
+            #         quality_scores,
+            #         targets,
+            #         fusion_indices
+            #     )
+                
+            #     if result[0] is not None:
+            #         (reduced_features, sampled_labels, misclass_classes, xi, 
+            #         (sampled_batch_idx, sampled_query_idx)) = result
+                    
+            #         # 获取原始特征
+            #         # original_features = pred_vpe_feats[sampled_batch_idx, sampled_query_idx]
+            #         original_features = fusion_feats[sampled_batch_idx, sampled_query_idx]
+                    
+            #         # 计算对比损失
+            #         loss_debridement = self.compute_debridement_contrastive_loss(
+            #             original_features, reduced_features, sampled_labels
+            #         )
+                    
+            #         # 每20步重新初始化分类层
+            #         self.reinitialize_classification_layer()
+            
             contrast_data = {
                 "contrast_feats": all_contrast_feats,     # [Total_Samples, C]
                 "contrast_labels": all_contrast_labels,   # [Total_Samples]
@@ -291,22 +366,27 @@ class VisualClassifier(nn.Module):
                 "matched_labels": flatten_labels,
                 "matched_ious": flatten_ious,  #[BN]
                 "matched_quality": flat_pred_quality,
+                # "loss_debridement": loss_debridement,
 
                 "layer_matched_aux": layer_matched_aux,
+                "fusion_indices": fusion_indices,
+                "targets": targets,
 
                 **contrast_data,
                 "num_boxes": self._get_num_boxes(targets, device),
-
                 # **grpo_data,
                 "outputs":outputs,  #联调用
+                "feats": feats  #多尺度特征
             }
         else:
             # 推理模式：直接使用前面算好的 refined_logits
             # outputs['pred_logits'] = refined_logits
-            outputs['vpe_logits'] = refined_logits        
+            outputs['pred_logits'] = refined_logits
+            outputs['vpe_logits'] = refined_logits1      
 
-            # ================= [推理阶段特征与混淆矩阵收集] =================
+            
             if targets is not None:
+                # ================= [推理阶段特征与混淆矩阵收集] =================
                 try:
                     fake_targets = []
                     for t in targets:
@@ -314,16 +394,16 @@ class VisualClassifier(nn.Module):
                         boxes_cxcywh_norm = box_xyxy_to_cxcywh(boxes_xyxy_norm)
                         fake_targets.append({"labels": t["labels"], "boxes": boxes_cxcywh_norm})
        
-                    # outputs_for_matcher = {
-                    #     'pred_logits': refined_logits, # 使用 VPE 修正后的分数
-                    #     'pred_boxes': pred_boxes
-                    # }
-                    # indices = self.matcher(outputs_for_matcher, targets)["indices"]             
-                    indices = rcnn_iou_match(
-                        pred_boxes=pred_boxes,
-                        targets=fake_targets,
-                        pos_threshold=0.6,   
-                    )[0]
+                    outputs_for_matcher = {
+                        'pred_logits': refined_logits, 
+                        'pred_boxes': pred_boxes
+                    }
+                    indices = self.matcher(outputs_for_matcher, targets)["indices"]
+                    # indices = rcnn_iou_match(
+                    #     pred_boxes=pred_boxes,
+                    #     targets=fake_targets,
+                    #     pos_threshold=0.6,   
+                    # )[0]
                     
                     flatten_labels = torch.full((B, N), -1, dtype=torch.long, device=device)
                     for i in range(B):
@@ -333,7 +413,7 @@ class VisualClassifier(nn.Module):
                     
                     flatten_labels = flatten_labels.reshape(-1)
                     flatten_vpe_logits = refined_logits.reshape(-1, self.num_classes)
-                    flatten_feats = pred_vpe_feats.reshape(B*N, -1)
+                    flatten_feats = fusion_feats.reshape(B*N, -1)
                     
                     pos_mask = (flatten_labels != -1).reshape(-1)
                     if pos_mask.any():
@@ -361,87 +441,336 @@ class VisualClassifier(nn.Module):
             torch.distributed.all_reduce(num_boxes)
         return torch.clamp(num_boxes / get_world_size(), min=1).item()
 
-    def get_losses(self, outputs, ref_cls_outputs=None, old_cls_outputs=None):
+    def sample_and_reduce_box_features(self, box_features, classifier_logits, quality_score, targets, indices):
+        """
+        在框特征空间进行采样和减少
+        Args:
+            box_features: [B, N, C] VPE 提取的框特征
+            classifier_logits: [B, N, C] 分类器 logits
+            quality_score: [B, N, 1] 质量分数
+            targets: list of dict 包含 labels
+            indices: 匹配结果 [(src_idx, tgt_idx), ...]
+        Returns:
+            reduced_features: [M, C] 减少后的框特征
+            sampled_labels: [M] 原始标签
+            misclass_classes: [M] 误分类目标类别
+            xi: [M] 扰动幅度
+            sampled_positions: (batch_indices, query_indices)
+        """
+        B, N, C = box_features.shape
+        device = box_features.device
+        
+        # 收集所有正样本框的特征和标签
+        all_pos_features = []
+        all_pos_labels = []
+        all_pos_batch_idx = []
+        all_pos_query_idx = []
+        all_pos_quality = []
+        
+        for i in range(B):
+            src_idx, tgt_idx = indices[i]
+            if len(src_idx) > 0:
+                pos_feats = box_features[i, src_idx]  # [K, C]
+                pos_labels = targets[i]["labels"][tgt_idx]  # [K]
+                pos_quality = quality_score[i, src_idx]  # [K, 1]
+                
+                all_pos_features.append(pos_feats)
+                all_pos_labels.append(pos_labels)
+                all_pos_batch_idx.extend([i] * len(src_idx))
+                all_pos_query_idx.extend(src_idx.cpu().tolist())
+                all_pos_quality.append(pos_quality) 
+        
+        if len(all_pos_features) == 0:
+            return None, None, None, None, None
+        
+        all_pos_features = torch.cat(all_pos_features, dim=0)  # [Total_Pos, C]
+        all_pos_labels = torch.cat(all_pos_labels, dim=0)      # [Total_Pos]
+        all_pos_batch_idx = torch.tensor(all_pos_batch_idx, device=device)
+        all_pos_query_idx = torch.tensor(all_pos_query_idx, device=device)
+        all_pos_quality = torch.cat(all_pos_quality, dim=0) # [Total_Pos, 1]
+        
+        # 计算采样概率（基于分类器对真实类别的置信度）
+        # 获取每个正样本对真实类别的预测概率
+        pos_logits = (classifier_logits)[all_pos_batch_idx, all_pos_query_idx]  # [Total_Pos, C]
+        pos_logits = pos_logits + all_pos_quality  # 融合质量分数
+        pos_probs = torch.sigmoid(pos_logits)  # [Total_Pos, C]
+        correct_probs = pos_probs[torch.arange(len(all_pos_labels)), all_pos_labels]
+        
+        # 采样概率 = 1 - 正确概率（容易误分类的样本采样概率高）
+        sampling_probs = 1 - correct_probs
+        sampling_probs = sampling_probs / (sampling_probs.sum() + 1e-8)
+        
+        # 采样
+        radio = self.debridement_sample_ratio
+        num_samples = max(1, int(len(all_pos_features) * radio))
+        sampled_indices_in_pos = torch.multinomial(sampling_probs, min(num_samples, len(all_pos_features)), replacement=False)
+        
+        sampled_features = all_pos_features[sampled_indices_in_pos]
+        sampled_labels = all_pos_labels[sampled_indices_in_pos]
+        sampled_batch_idx = all_pos_batch_idx[sampled_indices_in_pos]
+        sampled_query_idx = all_pos_query_idx[sampled_indices_in_pos]
+        sampled_quality = all_pos_quality[sampled_indices_in_pos]   # [M, 1]
+        
+        # 获取误分类目标类别（模型最可能误分类的类别）
+        sampled_logits = pos_logits[sampled_indices_in_pos]
+        sampled_probs = torch.sigmoid(sampled_logits)
+        masked_probs = sampled_probs.clone()
+        masked_probs[torch.arange(len(sampled_labels)), sampled_labels] = 0
+        misclass_classes = masked_probs.argmax(dim=-1)
+        
+        # 随机扰动幅度
+        xi = torch.empty(len(sampled_features), device=device).uniform_(
+            self.debridement_xi_range[0], self.debridement_xi_range[1]
+        )
+        
+        # 在特征空间进行梯度扰动
+        feat_cloned = sampled_features.clone().detach().requires_grad_(True)
+        
+        # 通过分类头（只用分类头，不需要完整前向）
+        # logits = self.cls_head(feat_cloned)
+        logits = self.fusion_cls_head(feat_cloned)
+        misclass_one_hot = F.one_hot(misclass_classes, num_classes=self.num_classes).float()
+
+        quality_expanded = sampled_quality.expand(-1, logits.shape[-1])  # [M, num_classes]
+        logits = logits + quality_expanded
+
+        # BCE Loss（不使用 weight 和 target_score，只用硬标签）
+        loss = F.binary_cross_entropy_with_logits(logits, misclass_one_hot, reduction='none')
+        loss = loss.sum(dim=-1)  # [M]
+        
+        # 计算梯度
+        gradients = torch.autograd.grad(loss.sum(), feat_cloned, create_graph=False, retain_graph=False)[0]
+        
+        # 特征扰动
+        with torch.no_grad():
+            reduced_features = feat_cloned + xi.view(-1, 1) * torch.sign(gradients)
+        
+        reduced_features = reduced_features.detach()
+
+        return (reduced_features, sampled_labels, misclass_classes, xi, 
+                (sampled_batch_idx, sampled_query_idx))
+
+        #修改了，加了quality_score
+   
+    def compute_debridement_contrastive_loss(self, original_features, reduced_features, labels):
+        """
+        100% 对齐论文 Adaptive Feature Debridement Loss (Eq.3)
+        """
+        if original_features is None or reduced_features is None:
+            return torch.tensor(0.0, device=original_features.device)
+        if len(labels) <= 1:
+            return torch.tensor(0.0, device=original_features.device)
+
+        v_i = F.normalize(original_features, dim=-1)
+        v_i_prime = F.normalize(reduced_features, dim=-1)
+        tau = self.debridement_tau
+
+        # 相似度矩阵
+        sim = torch.matmul(v_i, v_i.T) / tau  # [M, M]
+
+        # 正样本 mask
+        labels = labels.view(-1)
+        pos_mask = (labels.unsqueeze(0) == labels.unsqueeze(1)).to(v_i.device)
+        pos_mask.fill_diagonal_(False)  # 自己不算
+
+        # # ======================
+        # # 论文核心：margin 加到 所有 样本上！！
+        # # ======================
+        # margin = 1.0 - torch.sum(v_i * v_i_prime, dim=-1, keepdim=True)  # [M, 1]
+        # sim = sim + margin 
+
+        # Margin 只加到正样本对上
+        margin = 1.0 - torch.sum(v_i * v_i_prime, dim=-1)  # [M]
+        margin = margin.unsqueeze(1)  # [M, 1]
+        sim = sim + margin * pos_mask  # 只加到正样本对
+
+        # 分子：正样本
+        pos_exp = torch.exp(sim) * pos_mask
+        pos_sum = pos_exp.sum(dim=1)  # [M]
+
+        # 分母：所有样本
+        denominator = torch.exp(sim).sum(dim=1)  # [M]
+
+        # 有效样本
+        valid = pos_sum > 0
+        if not valid.any():
+            return torch.tensor(0.0, device=v_i.device)
+
+        loss = -torch.log(pos_sum[valid] / (denominator[valid] + 1e-8))
+        return loss.mean()   
+
+    def reinitialize_classification_layer(self):
+        """
+        按指定间隔重新初始化分类层（论文设置）
+        """
+        self.debridement_call_counter = getattr(self, 'debridement_call_counter', 0) + 1
+        
+        # 使用参数，而不是硬编码 20
+        if self.debridement_call_counter % self.debridement_reinit_interval == 0:
+            # nn.init.normal_(self.cls_head.head.weight, std=0.01)
+            nn.init.normal_(self.fusion_cls_head.head.weight, std=0.01)
+            prior_prob = 0.01
+            bias_value = -math.log((1 - prior_prob) / prior_prob)
+            # nn.init.constant_(self.cls_head.head.bias, bias_value)
+            nn.init.constant_(self.fusion_cls_head.head.bias, bias_value)
+            print(f"[Debridement] Step {self.debridement_call_counter}: Reinitialized classification layer")
+
+
+    def get_losses(self, outputs,  **kwargs):
         num_boxes = outputs["num_boxes"]
         losses = {}
-        #================vfl损失========================
-        # 主分支
-        losses_main = self.loss_labels_matched_branch(outputs, num_boxes, branch="main")
-        losses.update(losses_main)
+        if self.training:
+            # 主分支
+            losses_main = self.loss_labels_matched_branch(outputs, num_boxes, branch="main")
+            losses.update(losses_main)
+
+            losses.update(self.loss_labels_vfl(outputs["outputs"],outputs["targets"],outputs["fusion_indices"], num_boxes))
+
+            # Contrastive Loss
+            losses.update(self.loss_contrast_matched(outputs, num_boxes))
+
+            # S_ref = kwargs.get("S_ref", None)
+            # losses.update(self.loss_grqa(outputs, num_boxes, S_ref=S_ref))
+            # losses.update(self.loss_img_prototype(outputs))
+
+            #没用
+            # if "loss_debridement" in outputs:
+            #     losses["loss_debridement"] = outputs["loss_debridement"]
+
+            # if "grpo_logits" in outputs:
+            #     ref_cls_outputs = kwargs.get("ref_cls_outputs", None)
+            #     # grpo_loss_dict = self.grpo_loss_v1(outputs, num_boxes, ref_grpo_logits=ref_cls_outputs)
+            #     grpo_loss_dict = self.grpo_loss_v2(outputs, num_boxes, ref_grpo_logits=ref_cls_outputs)
+            #     losses.update(grpo_loss_dict)
+
+            losses = {
+                k: losses[k] * self.weight_dict[k] for k in losses if k in self.weight_dict
+            }
+            losses = {k + "_vpe_cls": v for k, v in losses.items()}
+
+        else:
+            # 主分支
+            losses_main = self.loss_labels_matched_branch(outputs, num_boxes, branch="main")
+            losses.update(losses_main)
+            losses = {
+                k: losses[k] * self.weight_dict[k] for k in losses if k in self.weight_dict
+            }
+            losses = {k + "_test_vpe_cls": v for k, v in losses.items()}
         
-        if len(outputs["layer_matched_aux"]) > 0:
-            losses_aux = self.loss_labels_matched_branch(outputs, num_boxes, branch="aux")
-            losses.update(losses_aux)
-            
-        
-        #=================Contrastive Loss====================
-        losses.update(self.loss_contrast_matched(outputs, num_boxes))     #all_contrast_feats只有gt
-
-        #==================GRPO Loss======================
-        if "grpo_logits" in outputs:
-            grpo_loss_dict = self.grpo_loss_v4(outputs, num_boxes, ref_grpo_logits=ref_cls_outputs, old_cls_outputs=old_cls_outputs)
-            losses.update(grpo_loss_dict)
-
-        losses = {
-            k: losses[k] * self.weight_dict[k] for k in losses if k in self.weight_dict
-        }
-        losses = {k + "_vpe_cls": v for k, v in losses.items()}
-
-        # # ================== 探测梯度贡献大小 ==================
-        # if self.training:
-        #     try:
-        #         # 这里用分类头的主权重作为观察对象
-        #         p = self.cls_head.head.weight
-
-        #         loss_cls_raw = losses.get("loss_cls_vpe_cls")
-        #         loss_rl_raw = losses.get("loss_rl_vpe_cls")
-        #         loss_contrast_raw = losses.get("loss_contrast_vpe_cls")
-
-        #         def _grad_norm(loss_tensor):
-        #             if loss_tensor is None or (not torch.is_tensor(loss_tensor)) or (not loss_tensor.requires_grad):
-        #                 return 0.0
-        #             g = torch.autograd.grad(
-        #                 loss_tensor,
-        #                 p,
-        #                 retain_graph=True,
-        #                 allow_unused=True,
-        #                 create_graph=False,
-        #             )[0]
-        #             if g is None:
-        #                 return 0.0
-        #             # 用 float 计算更稳，避免 AMP 下溢/上溢影响统计
-        #             return float(g.detach().float().norm(p=2).cpu())
-
-        #         g_cls = _grad_norm(loss_cls_raw)
-        #         g_rl = _grad_norm(loss_rl_raw)
-        #         g_ct = _grad_norm(loss_contrast_raw)
-
-        #         denom = g_cls + g_rl + g_ct + 1e-12
-        #         r_cls = g_cls / denom
-        #         r_rl = g_rl / denom
-        #         r_ct = g_ct / denom
-
-        #         # 限频打印：每 200 step 打一次（用 buffer 计数，不影响 DDP）
-        #         if not hasattr(self, "_grad_dbg_step"):
-        #             self._grad_dbg_step = 0
-        #         self._grad_dbg_step += 1
-
-        #         if self._grad_dbg_step % 1 == 0:
-        #             # 只在 rank0 打印，避免多卡刷屏
-        #             if not is_dist_available_and_initialized() or torch.distributed.get_rank() == 0:
-        #                 print(
-        #                     f"[GRAD RATIO][cls_head.weight] "
-        #                     f"||g_cls||={g_cls:.4e} ({r_cls:.2%}) | "
-        #                     f"||g_rl||={g_rl:.4e} ({r_rl:.2%}) | "
-        #                     f"||g_ct||={g_ct:.4e} ({r_ct:.2%})"
-        #                 )
-        #     except Exception as e:
-        #         if not is_dist_available_and_initialized() or torch.distributed.get_rank() == 0:
-        #             print(f"[GRAD RATIO] skipped due to error: {type(e).__name__}: {str(e)}")
-
         return losses
 
+   
+    def loss_grqa(self, outputs, num_boxes, S_ref=None):
+        feats = outputs["outputs"].get("fusion_feats", None)
+        if feats is None or feats.numel() == 0:
+            return {"loss_rl": torch.tensor(0.0, device=self.class_prototypes.device, requires_grad=True)}
+        
+        B, N, C = feats.shape
+        K = B * N
+        Q_L = feats.view(K, C)
+        P = self.class_prototypes.detach()
+        
+        # 1. 查询-原型对齐奖励
+        Q = F.normalize(Q_L, p=2, dim=-1)
+        P_norm = F.normalize(P, p=2, dim=-1)
+        
+        # 计算查询与全局原型相似度矩阵 S
+        S_theta = torch.matmul(Q, P_norm.t()) # [K, num_classes]
+        
+        # 选取相似度最高的类别作为匹配类别，对应相似度作为奖励值
+        r_i, c_i = S_theta.max(dim=-1) # [K], [K]
+        
+        # 2. 组相对优势 (借鉴 GRPO)
+        A_i = torch.zeros_like(r_i)
+        for c in range(self.num_classes):
+            mask = (c_i == c)
+            num_in_group = mask.sum()
+            if num_in_group > 1:
+                group_rewards = r_i[mask]
+                mean_g = group_rewards.mean()
+                std_g = group_rewards.std(unbiased=False)
+                A_i[mask] = (group_rewards - mean_g) / (std_g + 1e-8)
+            elif num_in_group == 1:
+                A_i[mask] = 0.0  # 单独一个样本算作平均表现，无优势
+                
+        # 3. GRPO 式裁剪与 KL 稳定正则
+        pi_theta = F.softmax(S_theta, dim=-1)
+        pi_theta_c = pi_theta.gather(-1, c_i.unsqueeze(-1)).squeeze(-1)
+        
+        if S_ref is not None:
+            if S_ref.dim() > 2:
+                S_ref = S_ref.view(K, -1)
+            pi_ref = F.softmax(S_ref, dim=-1)
+            pi_ref_c = pi_ref.gather(-1, c_i.unsqueeze(-1)).squeeze(-1)
+        else:
+            pi_ref_c = pi_theta_c.detach()
+            
+        # 重要性比率
+        rho_i = pi_theta_c / (pi_ref_c + 1e-8)
+        
+        epsilon = 0.1  # 裁剪边界
+        surrogate1 = rho_i * A_i
+        surrogate2 = torch.clamp(rho_i, 1 - epsilon, 1 + epsilon) * A_i
+        loss_gr = -torch.min(surrogate1, surrogate2).mean()
+        
+        # 前向 KL 散度约束 (Forward KL)
+        ratio = pi_ref_c / (pi_theta_c + 1e-8)
+        kl_div = (ratio - torch.log(ratio + 1e-8) - 1.0).mean()
+        
+        beta = 0.001  # 正则化系数
+        loss_grqa = loss_gr + beta * kl_div
+        
+        return {"loss_rl": loss_grqa}
+    
+    def loss_img_prototype(self, outputs):
+        """L_img: 约束单图原型与全局原型距离，减小类内特征方差，并进行EMA更新"""
+        if "gt_feats" not in outputs or "gt_labels" not in outputs:
+            return {"loss_img_proto": torch.tensor(0.0, device=self.class_prototypes.device)}
 
+        gt_feats = outputs["gt_feats"]                    # [N_gt, D]
+        gt_labels = outputs["gt_labels"]                  # [N_gt]
+        
+        if gt_labels.numel() == 0:
+            return {"loss_img_proto": torch.tensor(0.0, device=self.class_prototypes.device)}
+
+        # 过滤背景
+        valid_mask = gt_labels != -1
+        gt_labels_valid = gt_labels[valid_mask]
+        gt_feats_valid = gt_feats[valid_mask]
+        
+        if gt_labels_valid.numel() == 0:
+            return {"loss_img_proto": torch.tensor(0.0, device=self.class_prototypes.device)}
+
+        unique_c = torch.unique(gt_labels_valid)
+        loss_img = torch.tensor(0.0, device=self.class_prototypes.device)
+
+        alpha = self.proto_momentum
+
+        for c in unique_c:
+            mask = (gt_labels_valid == c)
+            feats_c = gt_feats_valid[mask]
+            
+            # 1. 均值特征并做 L2 归一化 (f_c)
+            fc = feats_c.mean(dim=0)
+            fc = F.normalize(fc, dim=-1)
+            
+            # 2. 计算损失： || f_c - P_c ||_2^2
+            # P_c 需要 detach，以免更新全局原型时破坏网络图梯度
+            Pc = self.class_prototypes[c].detach()
+            loss_img += torch.sum((fc - Pc) ** 2)
+
+            # 3. EMA 无梯度更新全局原型库
+            if self.training:
+                with torch.no_grad():
+                    new_Pc = alpha * self.class_prototypes[c] + (1.0 - alpha) * fc.detach()
+                    self.class_prototypes[c] = F.normalize(new_Pc, dim=-1)
+
+        # 依据批次中包含的类数计算平均损失
+        loss_img = loss_img / max(len(unique_c), 1)
+
+        return {"loss_img_proto": loss_img}
+
+    #vfl
     def loss_labels_matched_branch(self, outputs, num_boxes, branch="main"):
         if branch == "main":
             src_logits = outputs["matched_vpe_logits"]
@@ -450,61 +779,65 @@ class VisualClassifier(nn.Module):
             quality = outputs["matched_quality"]
             loss_name = "loss_cls"
 
-            if quality.dim() == 1:
-                quality = quality.unsqueeze(-1)
-            fused_logits = src_logits + quality
 
-            target_classes = target_labels.clone()
-            target_classes[target_classes == -1] = self.num_classes 
-            target = F.one_hot(target_classes, num_classes=self.num_classes + 1)[..., :-1].float()
-            target_score = target * ious.view(-1, 1).pow(0.5)
+        if quality.dim() == 1:
+            quality = quality.unsqueeze(-1)
+        fused_logits = src_logits + quality
 
-            with torch.no_grad():
-                pred_score = fused_logits.sigmoid().detach()
-                weight = self.alpha * pred_score.pow(self.gamma) * (1 - target) + target_score
+        target_classes = target_labels.clone()
+        target_classes[target_classes == -1] = self.num_classes 
+        # target 形状为 [4800, 10]
+        target = F.one_hot(target_classes, num_classes=self.num_classes + 1)[..., :-1].float()
+
+        # 构造 Target Score (IoU 软标签)
+        target_score = target * ious.view(-1, 1).pow(0.5)
+        # target_score = target * ious.view(-1, 1)
+
+        with torch.no_grad():
+            pred_score = fused_logits.sigmoid().detach()
+            weight = self.alpha * pred_score.pow(self.gamma) * (1 - target) + target_score
 
             # #DEIM权重
             # target_score = target_score.pow(1.5)
             # weight = pred_score.pow(1.5) * (1 - target) + target
 
-            loss = F.binary_cross_entropy_with_logits(
-                fused_logits, target_score, weight=weight, reduction="none"
-            )   # [B*N,10]
 
-            return {loss_name: loss.sum() / num_boxes}
-        else:
-            # 辅助分支的输入
-            aux_data = outputs["layer_matched_aux"]  # 根据层索引获取对应数据
-            total_aux_loss = 0.0
-            loss_name = "loss_cls_aux"
-            for layer_data in aux_data:
-                src_logits = layer_data["matched_vpe_logits_aux"]
-                target_labels = layer_data["matched_labels_aux"]
-                ious = layer_data["matched_ious_aux"].detach()
-                quality = layer_data["matched_quality_aux"]
-                layer_idx = layer_data["layer_idx"]
-                
-                if quality.dim() == 1:
-                    quality = quality.unsqueeze(-1)
-                fused_logits = src_logits + quality
+        loss = F.binary_cross_entropy_with_logits(
+            fused_logits, target_score, weight=weight, reduction="none"
+        )   # [B*N,10]
 
-                target_classes = target_labels.clone()
-                target_classes[target_classes == -1] = self.num_classes 
-                target = F.one_hot(target_classes, num_classes=self.num_classes + 1)[..., :-1].float()
-                target_score = target * ious.view(-1, 1).pow(0.5)
+        return {loss_name: loss.sum() / num_boxes}
 
-                with torch.no_grad():
-                    pred_score = fused_logits.sigmoid().detach()
-                    weight = self.alpha * pred_score.pow(self.gamma) * (1 - target) + target_score
+    def loss_labels_vfl(self, outputs, targets, indices, num_boxes):
+        idx = self._get_src_permutation_idx(indices)
 
+        src_boxes = outputs["pred_boxes"][idx]
+        target_boxes = torch.cat([t["boxes"][i] for t, (_, i) in zip(targets, indices)], dim=0)
+        ious, _ = box_iou(box_cxcywh_to_xyxy(src_boxes), box_cxcywh_to_xyxy(target_boxes))
+        ious = torch.diag(ious).detach()
 
-                loss = F.binary_cross_entropy_with_logits(
-                    fused_logits, target_score, weight=weight, reduction="none"
-                )   # [B*N,10]
-                total_aux_loss += loss
-                total_aux_loss = total_aux_loss.sum() / num_boxes
+        src_logits = outputs["fusion_logits"]  #[B,N,C]
+        target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
 
-            return {loss_name: total_aux_loss}
+        target_classes = torch.full(
+            src_logits.shape[:2], self.num_classes, dtype=torch.int64, device=src_logits.device
+        )
+        target_classes[idx] = target_classes_o
+        target = F.one_hot(target_classes, num_classes=self.num_classes + 1)[..., :-1]
+
+        target_score_o = torch.zeros_like(target_classes, dtype=src_logits.dtype)
+        target_score_o[idx] = ious.to(target_score_o.dtype).pow(0.5)
+        target_score = target_score_o.unsqueeze(-1) * target
+
+        pred_score = F.sigmoid(src_logits).detach()
+
+        weight = self.alpha * pred_score.pow(self.gamma) * (1 - target) + target_score
+        loss = F.binary_cross_entropy_with_logits(
+            src_logits, target_score, weight=weight, reduction="none"
+        )
+
+        loss = loss.mean(1).sum() * src_logits.shape[1] / num_boxes
+        return {"loss_fusion_cls": loss}
 
 
     def loss_contrast_matched2(self, outputs, num_boxes):
@@ -525,7 +858,7 @@ class VisualClassifier(nn.Module):
 
         # 使用 num_boxes 归一化
         return {"loss_contrast": loss / num_boxes} 
-    
+      
     def loss_contrast_matched1(self, outputs, num_boxes):
         """
         基于原型的 CSPCL 机制
@@ -540,14 +873,6 @@ class VisualClassifier(nn.Module):
        
         if torch.isnan(query_feats).any():
             return {"loss_contrast": torch.tensor(0.0, device=prototypes.device)}
-
-        # ========== 确保精度一致 ==========
-        # 获取当前精度
-        target_dtype = query_feats.dtype  # FP16 或 FP32
-        
-        # 将 prototypes 转换为相同精度
-        if prototypes.dtype != target_dtype:
-            prototypes = prototypes.to(target_dtype)
    
         gamma = 5e-3   
         tau = 0.3     
@@ -729,6 +1054,8 @@ class VisualClassifier(nn.Module):
         tgt_iou = curr_ious.clamp(0.0, 1.0)
         rewards = tgt_iou  # [Total_M, G]
 
+        # rewards = compute_robust_grpo_reward(logits_g, grpo_data["grpo_labels"], grpo_data["grpo_ious"])
+
         # 组内标准化 (Advantage) - 核心 GRPO 逻辑
         mean_r = rewards.mean(dim=1, keepdim=True)
         std_r = rewards.std(dim=1, keepdim=True, unbiased=False)
@@ -766,226 +1093,9 @@ class VisualClassifier(nn.Module):
         return final_losses 
    
     def grpo_loss_v2(self, grpo_data, num_boxes, ref_grpo_logits=None):
-
         """
-        Args:
-            grpo_data: sample_grpo_features 返回的字典
-                - grpo_logits: [Total_M, G, C]
-                - grpo_ious:   [Total_M, G]
-                - grpo_labels: [Total_M]
-            num_boxes: 归一化因子
-            ref_grpo_logits: 参考模型的 Logits, [Total_M * G, C]
-        """
-        final_losses = {}
-        logits_g = grpo_data["grpo_logits"]
-    
-        if logits_g is None or logits_g.numel() == 0:
-            return {"loss_rl": logits_g.sum() * 0.0} # 保持梯度流的 0 损失
-
-        Total_M, G, C = logits_g.shape
-        device = logits_g.device
-
-        grpo_advantage_weight = 0.1
-        grpo_beta = 0.03
-        epsilon = 1e-9
-
-        #准备标签 [Total_M, G]
-        tgt_labels = grpo_data["grpo_labels"].view(-1, 1).expand(-1, G)
-        curr_ious = grpo_data["grpo_ious"] # [Total_M, G]
-        grpo_cost_bbox = grpo_data["grpo_cost_bbox"]
-
-        # #负（类别cost+IOU）作为奖励
-        # prob = torch.sigmoid(logits_g)
-        # tgt_prob = prob.gather(2, tgt_labels.unsqueeze(-1)).squeeze(-1)  # [Total_M, G]
-        # neg_cost_class = (
-        #     (1 - 0.25) * (tgt_prob**2.0) * (-(1 - tgt_prob + 1e-8).log())
-        # )
-        # pos_cost_class = (
-        #     0.25 * ((1 - tgt_prob) ** 2.0) * (-(tgt_prob + 1e-8).log())
-        # )
-        # # cost = 2*(pos_cost_class - neg_cost_class) - 2*curr_ious + 5*grpo_cost_bbox
-        # cost = 2*(pos_cost_class - neg_cost_class) - 2*curr_ious
-        # cost = torch.nan_to_num(cost, nan=1.0, posinf=1e6, neginf=-1e6)
-        # rewards = -cost
-
-
-        # tgt_logits = logits_g.gather(2, tgt_labels.unsqueeze(-1)).squeeze(-1)  # [Total_M, G]
-        # tgt_iou = curr_ious.clamp(0.0, 1.0)
-        # # GT 类上的 soft BCE：IoU 越大 -> 目标越接近 1 -> 奖励越高
-        # individual_loss = F.binary_cross_entropy_with_logits(
-        #     tgt_logits,
-        #     tgt_iou,
-        #     reduction="none",
-        # )  # [Total_M, G]
-
-        # rewards = -individual_loss
-
-        tgt_iou = curr_ious.clamp(0.0, 1.0)
-        rewards = tgt_iou  # [Total_M, G]
-
-        # # 组内标准化 (Advantage) - 核心 GRPO 逻辑
-        mean_r = rewards.mean(dim=1, keepdim=True)
-        std_r = rewards.std(dim=1, keepdim=True, unbiased=False)
-        advantages = (rewards - mean_r) / (std_r + epsilon) # [Total_M, G]
-        advantages = torch.clamp(advantages, -2, 2).detach()
-
-        bad_mask = tgt_iou < 0.4
-        advantages = torch.where(bad_mask, torch.full_like(advantages, -1.0), advantages)
-        advantages = torch.clamp(advantages, -2, 2).detach()
-
-        #logits_g 维度应该是 [Total_M, G, C]
-        tgt_logits = logits_g.gather(2, tgt_labels.unsqueeze(-1)).squeeze(-1)  # [Total_M, G]
-        logp = F.logsigmoid(tgt_logits)  # [Total_M, G]
-
-        if ref_grpo_logits is not None:
-            ref_grpo_logits = ref_grpo_logits.view(Total_M, G, C)
-            ref_tgt_logits = ref_grpo_logits.detach().gather(2, tgt_labels.unsqueeze(-1)).squeeze(-1)
-
-            p = torch.sigmoid(tgt_logits)         # current prob, [M,G]
-            pref = torch.sigmoid(ref_tgt_logits)  # ref prob, [M,G]
-
-            kl = pref * (torch.log(pref + epsilon) - torch.log(p + epsilon)) + \
-                 (1.0 - pref) * (torch.log(1.0 - pref + epsilon) - torch.log(1.0 - p + epsilon))
-        else:
-            kl = torch.zeros_like(logp)
-
-        # 计算 Policy Loss
-        # GRPO 的核心：优势函数越大，logp 应该越大；KL 散度作为惩罚
-        element_loss = -(logp * advantages.detach()) * grpo_advantage_weight + grpo_beta * kl
-
-        # #  归一化与返回
-        # # 额外的分类一致性奖励（可选）
-        # pred_prob = torch.sigmoid(logits_g).gather(2, tgt_labels.unsqueeze(-1)).squeeze(-1)
-        # consistency_bonus = (pred_prob - curr_ious).abs()  # 偏差越大惩罚越大
-        # consistency = consistency_bonus.mean() * 0.04
-        # loss_rl = element_loss.mean() +consistency
-        loss_rl = element_loss.mean()
-        final_losses["loss_rl"] = loss_rl
-
-        return final_losses 
-    
-    def grpo_loss_v3(self, grpo_data, num_boxes, ref_grpo_logits=None, old_cls_outputs=None):
-
-        """
-        Args:
-            grpo_data: sample_grpo_features 返回的字典
-                - grpo_logits: [Total_M, G, C]
-                - grpo_ious:   [Total_M, G]
-                - grpo_labels: [Total_M]
-            num_boxes: 归一化因子
-            ref_grpo_logits: 参考模型的 Logits, [Total_M * G, C]
-        """
-        final_losses = {}
-        logits_g = grpo_data["grpo_logits"]
-    
-        if logits_g is None or logits_g.numel() == 0:
-            return {"loss_rl": logits_g.sum() * 0.0} # 保持梯度流的 0 损失
-
-        Total_M, G, C = logits_g.shape
-        device = logits_g.device
-
-        grpo_advantage_weight = 0.1
-        grpo_beta = 0.03
-        epsilon = 1e-9
-
-        #准备标签 [Total_M, G]
-        tgt_labels = grpo_data["grpo_labels"].view(-1, 1).expand(-1, G)
-        curr_ious = grpo_data["grpo_ious"] # [Total_M, G]
-        grpo_cost_bbox = grpo_data["grpo_cost_bbox"]
-
-        #负（类别cost+IOU）作为奖励
-        prob = torch.sigmoid(logits_g)
-        tgt_prob = prob.gather(2, tgt_labels.unsqueeze(-1)).squeeze(-1)  # [Total_M, G]
-        neg_cost_class = (
-            (1 - 0.25) * (tgt_prob**2.0) * (-(1 - tgt_prob + 1e-8).log())
-        )
-        pos_cost_class = (
-            0.25 * ((1 - tgt_prob) ** 2.0) * (-(tgt_prob + 1e-8).log())
-        )
-        # cost = 2*(pos_cost_class - neg_cost_class) - 2*curr_ious + 5*grpo_cost_bbox
-        cost = 2*(pos_cost_class - neg_cost_class) - 2*curr_ious
-        cost = torch.nan_to_num(cost, nan=1.0, posinf=1e6, neginf=-1e6)
-        rewards = -cost
-
-        # tgt_iou = curr_ious.clamp(0.0, 1.0)
-        # rewards = tgt_iou  # [Total_M, G]
-
-        # 组内标准化 (Advantage) - 核心 GRPO 逻辑
-        mean_r = rewards.mean(dim=1, keepdim=True)
-        std_r = rewards.std(dim=1, keepdim=True, unbiased=False)
-        advantages = (rewards - mean_r) / (std_r + epsilon) # [Total_M, G]
-        advantages = torch.clamp(advantages, -2, 2).detach()
-
-        #logits_g 维度应该是 [Total_M, G, C]
-        tgt_logits = logits_g.gather(2, tgt_labels.unsqueeze(-1)).squeeze(-1)  # [Total_M, G]
-        logp = F.logsigmoid(tgt_logits)  # [Total_M, G]
-        
-        # 对所有类别的概率做kl散度
-        if ref_grpo_logits is not None:
-            ref_grpo_logits = ref_grpo_logits.view(Total_M, G, C)
-            student_prob = torch.sigmoid(logits_g)
-
-            with torch.no_grad():
-                teacher_prob = torch.sigmoid(ref_grpo_logits)
-
-            kl = (
-                teacher_prob * (torch.log(teacher_prob + epsilon)- torch.log(student_prob + epsilon))
-                +
-                (1.0 - teacher_prob) * (torch.log(1.0 - teacher_prob + epsilon) 
-                - torch.log(1.0 - student_prob + epsilon))
-            )
-
-            # [M,G,C] -> [M,G]
-            kl = kl.mean(dim=-1)
-        else:
-            kl = torch.zeros((Total_M, G), device=device)
-
-        # --------------------------------------------------------
-        # 只强化 positive advantage
-        # 防止 GT -> -∞
-        # --------------------------------------------------------
-        positive_advantages = advantages.clamp(min=0.0)
-        policy_loss = -(logp * positive_advantages)* grpo_advantage_weight
-
-        confidence_penalty_weight = 0.05
-        low_iou_mask = (curr_ious < 0.4).float()
-        confidence_penalty = (torch.sigmoid(tgt_logits)* low_iou_mask* confidence_penalty_weight)
-
-        # --------------------------------------------------------
-        # Hard competitor suppression
-        # --------------------------------------------------------
-        non_tgt_mask = torch.ones_like(logits_g,dtype=torch.bool)
-        non_tgt_mask.scatter_(2,tgt_labels.unsqueeze(-1),False)
-        non_tgt_logits = logits_g.masked_fill(~non_tgt_mask,float("-inf")) # [Total_M, G, C]
-        max_comp_logits, _ = non_tgt_logits.max(dim=2)
-
-        # margin ranking
-        margin = tgt_logits - max_comp_logits
-        dynamic_margin = 0.2 + 0.5 * curr_ious
-
-        ranking_loss = F.relu(dynamic_margin.detach() - margin) * 0.2
-        
-        
-        # 计算 Policy Loss
-        total_loss = policy_loss + kl + confidence_penalty + ranking_loss
-        loss_rl = total_loss.mean()
-        
-        # element_loss = -(logp * advantages.detach()) * grpo_advantage_weight + grpo_beta * kl
-        # loss_rl = element_loss.mean()
-
-        final_losses["loss_rl"] = loss_rl
-        return final_losses 
-
-    def grpo_loss_v4(self, grpo_data, num_boxes, ref_grpo_logits=None, old_cls_outputs=None):
-        """
-        Args:
-            grpo_data: sample_grpo_features 返回的字典
-                - grpo_logits: [Total_M, G, C]
-                - grpo_ious:   [Total_M, G]
-                - grpo_labels: [Total_M] (正确类别的索引)
-            num_boxes: 归一化因子
-            ref_grpo_logits: 参考模型的 Logits
-            old_cls_outputs: 旧策略的分类输出 [Total_M, G, C] 或 [Total_M, G]
+        改进版 GRPO 损失，旨在提升 mAP。
+        核心思想：利用采样的 IoU 梯度来塑造更好的置信度分布。
         """
         final_losses = {}
         logits_g = grpo_data["grpo_logits"]
@@ -995,115 +1105,64 @@ class VisualClassifier(nn.Module):
 
         Total_M, G, C = logits_g.shape
         device = logits_g.device
-        epsilon = 1e-9
 
-        # 超参数配置
-        grpo_advantage_weight = 0.1
-        grpo_beta = 0.03
-        grpo_clip_epsilon = 0.2
-        
-        # 排名奖励配置
-        reward_top1 = 1.0   # 正确类别排第1的奖励
-        reward_top2 = 0.5   # 正确类别排第2的奖励
-        reward_other = -0.5 # 正确类别排其他的负奖励
+        # 超参数
+        grpo_advantage_weight = 1.0
+        grpo_beta = 0.01
+        epsilon = 1e-8
 
-        # 准备标签
-        tgt_labels = grpo_data["grpo_labels"].view(-1) # [Total_M]
-        curr_ious = grpo_data["grpo_ious"]  # [Total_M, G]
+        # 数据准备
+        tgt_labels = grpo_data["grpo_labels"].view(-1, 1).expand(-1, G)
+        curr_ious = grpo_data["grpo_ious"].clamp(0.0, 1.0) # [Total_M, G]
 
-        # ========== 1. 重新设计 Rewards 和 Advantages ==========
-        
-        # 1.1 计算当前模型对各个类别的置信度 (使用 sigmoid)
-        probs = torch.sigmoid(logits_g) # [Total_M, G, C]
-        
-        # 1.2 提取正确类别的置信度，并计算其在组内的排名
-        # 获取正确类别的预测概率 [Total_M, G]
-        tgt_prob = probs.gather(2, tgt_labels.view(-1, 1, 1).expand(-1, G, 1)).squeeze(-1)
-        
-        # 计算排名：将组内(G)所有类别的概率与正确类别的概率比较
-        # 如果其他类别的概率 >= 正确类别的概率，则排名落后
-        # (probs >= tgt_prob.unsqueeze(-1)) 会得到 [Total_M, G, C] 的布尔矩阵
-        is_greater_or_equal = (probs >= tgt_prob.unsqueeze(-1)).float()
-        # 对每个样本的每个组(G)，统计有多少个类别的概率 >= 正确类别的概率，即为排名
-        ranks = is_greater_or_equal.sum(dim=2) # [Total_M, G]
-        
-        # 1.3 根据排名分配基础奖励
-        ranking_reward = torch.where(
-            ranks == 1, 
-            torch.tensor(reward_top1, device=device),
-            torch.where(
-                ranks == 2,
-                torch.tensor(reward_top2, device=device),
-                torch.tensor(reward_other, device=device)
-            )
-        )
-        
-        # 1.4 结合 IoU 进行加权 (IoU作为质量系数，范围 [0.5, 1.0])
-        # 这样即使排名对了，如果框不准(IoU低)，奖励也会降低
-        iou_factor = 0.5 + 0.5 * curr_ious 
-        rewards = ranking_reward * iou_factor
+        # ==================== 新核心：基于 IoU 的奖励设计 ====================
+        # 1. 基础奖励：IoU，但加入“信心门槛”概念
+        # 高 IoU (>= 0.5) 给予正向奖励，低 IoU (< 0.5) 给予惩罚
+        # 这模拟了 AP 计算中的 TP/FP 逻辑
+        threshold = 0.5
+        reward_base = torch.where(curr_ious >= threshold, curr_ious, -curr_ious)
 
-        # 1.5 组内标准化 (GRPO 核心)
+        # 2. (可选) 增强奖励：强调高 IoU 与低 IoU 的差异
+        # 让 IoU=0.9 的奖励显著高于 IoU=0.6，加速学习
+        # reward_enhanced = reward_base * (curr_ious ** 2) # 平方增强高 IoU
+
+        # 使用基础奖励
+        rewards = reward_base
+
+        # ==================== 标准 GRPO 流程 ====================
         mean_r = rewards.mean(dim=1, keepdim=True)
         std_r = rewards.std(dim=1, keepdim=True, unbiased=False)
         advantages = (rewards - mean_r) / (std_r + epsilon)
-        advantages = torch.clamp(advantages, -2.0, 2.0).detach()
+        advantages = torch.clamp(advantages, -2, 2).detach()
 
-        # ========== 2. 当前策略的 logp ==========
-        # 提取正确类别的 logits
-        tgt_logits = logits_g.gather(2, tgt_labels.view(-1, 1, 1).expand(-1, G, 1)).squeeze(-1)
-        tgt_logits = torch.clamp(tgt_logits, -15, 15) 
-        current_logp = F.logsigmoid(tgt_logits)  # [Total_M, G]
+        # 获取目标类的 logits: [Total_M, G]
+        tgt_logits = logits_g.gather(2, tgt_labels.unsqueeze(-1)).squeeze(-1)
 
-        # ========== 3. 旧策略的 logp ==========
-        if old_cls_outputs is not None:
-            old_cls_outputs = old_cls_outputs.view(Total_M, G, C) 
-            old_tgt_logits = old_cls_outputs.detach().gather(2, tgt_labels.view(-1, 1, 1).expand(-1, G, 1)).squeeze(-1)
-            old_tgt_logits = torch.clamp(old_tgt_logits, -15, 15)
-            old_logp = F.logsigmoid(old_tgt_logits)
-        else:
-            old_logp = current_logp.detach()
+        # 使用稳定的 NLL (Negative Log-Likelihood)
+        # 如果 IoU > 0.5，我们希望 p 接近 1，所以 target 是 1
+        # 如果 IoU <= 0.5，我们希望 p 接近 0，所以 target 是 0
+        # 这样构建一个“软”目标，引导模型学习 IoU 与置信度的关系
+        soft_targets = (curr_ious > threshold).float() # [Total_M, G]
+        nll_loss = F.binary_cross_entropy_with_logits(tgt_logits, soft_targets, reduction='none')
 
-        # ========== 4. GRPO Policy Loss ==========
-        ratio = torch.exp(current_logp - old_logp)  # [Total_M, G]
-        ratio = torch.clamp(ratio, 0.0, 3.0) 
-        
-        surrogate1 = ratio * advantages
-        surrogate2 = torch.clamp(ratio, 1 - grpo_clip_epsilon, 1 + grpo_clip_epsilon) * advantages
-        policy_loss = -torch.min(surrogate1, surrogate2) 
+        # KL 散度 (保持不变，用于稳定性)
+        kl = torch.zeros_like(nll_loss)
+        if ref_grpo_logits is not None:
+            ref_grpo_logits = ref_grpo_logits.view(Total_M, G, C)
+            ref_tgt_logits = ref_grpo_logits.detach().gather(2, tgt_labels.unsqueeze(-1)).squeeze(-1)
+            p = torch.sigmoid(tgt_logits).clamp(epsilon, 1 - epsilon)
+            pref = torch.sigmoid(ref_tgt_logits).clamp(epsilon, 1 - epsilon)
+            kl = pref * (torch.log(pref + epsilon) - torch.log(p + epsilon))
 
-        policy_loss = policy_loss.mean() * grpo_advantage_weight
+        # ==================== 组合损失 ====================
+        # 核心：使用优势函数来调制 NLL 损失
+        # 优势为正 (好样本) -> 降低 NLL (让模型更确信预测)
+        # 优势为负 (坏样本) -> 提升 NLL (让模型降低确信度)
+        policy_loss = advantages.detach() * nll_loss # 注意符号！
+        total_loss = policy_loss * grpo_advantage_weight + grpo_beta * kl
 
-        # ========== 5. KL 散度 ==========
-        if old_cls_outputs is not None:
-            old_tgt_logits = old_cls_outputs = old_cls_outputs.view(Total_M, G, C) 
-            student_prob = torch.sigmoid(logits_g)
-            with torch.no_grad():
-                teacher_prob = torch.sigmoid(old_tgt_logits)
-            
-            # 使用二元 KL 散度
-            kl = (teacher_prob * (torch.log(teacher_prob + epsilon) - torch.log(student_prob + epsilon)) +
-                (1.0 - teacher_prob) * (torch.log(1.0 - teacher_prob + epsilon) - torch.log(1.0 - student_prob + epsilon)))
-            kl = kl.mean(dim=-1)  # [Total_M, G]
-            kl_loss = (kl * grpo_beta).mean()
-        else:
-            kl_loss = torch.tensor(0.0, device=device)
-
-        # ========== 6. 辅助损失 (可选，建议保留 Ranking Loss 作为辅助监督) ==========
-        # 这里的 Ranking Loss 依然保留，它和上面的 Reward 逻辑是互补的
-        non_tgt_mask = torch.ones_like(logits_g, dtype=torch.bool)
-        non_tgt_mask.scatter_(2, tgt_labels.view(-1, 1, 1).expand(-1, G, 1), False)
-        non_tgt_logits = logits_g.masked_fill(~non_tgt_mask, float("-inf"))
-        max_comp_logits, _ = non_tgt_logits.max(dim=2)
-        
-        margin = tgt_logits - max_comp_logits
-        # 动态 margin：IoU 越高，我们希望 margin 越大（区分度越高）
-        dynamic_margin = 0.2 + 0.5 * curr_ious
-        ranking_loss = F.relu(dynamic_margin.detach() - margin).mean() * 0.1 # 稍微降低权重，让 RL 主导
-
-        # ========== 7. 总损失 ==========
-        total_loss = policy_loss + kl_loss + ranking_loss     
-        final_losses["loss_rl"] = total_loss
+        loss_rl = total_loss.mean()
+        final_losses["loss_rl"] = loss_rl
 
         return final_losses
 
@@ -1122,66 +1181,47 @@ class VisualClassifier(nn.Module):
     ):
         """
         GRPO 采样：四条边 (l,t,r,b) 独立随机采样，只保证最终框合法
-        对所有 GT 框进行采样，不依赖匹配结果
         """
         device = outputs["pred_boxes"].device
         B, N, _ = outputs["pred_boxes"].shape
 
-        # ===== 收集所有 GT 框（不依赖匹配） =====
-        all_tgt_boxes_list = []
-        all_tgt_labels_list = []
-        gt_per_image = []
-        
-        for i in range(B):
-            gt_boxes = targets[i]["boxes"]   # [num_gts, 4] cxcywh
-            gt_labels = targets[i]["labels"] # [num_gts]
-            num_gts = gt_boxes.shape[0]
-            
-            if num_gts > 0:
-                all_tgt_boxes_list.append(gt_boxes)
-                all_tgt_labels_list.append(gt_labels)
-                gt_per_image.append(num_gts)
-            else:
-                gt_per_image.append(0)
-        
-        if len(all_tgt_boxes_list) == 0:
-            return {"grpo_logits": None, "grpo_ious": None, "grpo_labels": None, "grpo_cost_bbox": None}
-        
-        all_tgt_boxes = torch.cat(all_tgt_boxes_list, dim=0)   # [Total_GT, 4]
-        all_tgt_labels = torch.cat(all_tgt_labels_list, dim=0) # [Total_GT]
-        Total_M = len(all_tgt_labels)
-        
-        # 记录每个 GT 属于哪个 batch（用于回填）
-        gt_batch_idx = []
-        for i, num_gts in enumerate(gt_per_image):
-            for _ in range(num_gts):
-                gt_batch_idx.append(i)
-        gt_batch_idx = torch.tensor(gt_batch_idx, device=device)
+        batch_idx_map = torch.cat([torch.full((len(indices[i][0]),), i, device=device) for i in range(B)])
+        src_idx_map = torch.cat([indices[i][0].to(device) for i in range(B)])
+        tgt_idx_map = torch.cat([indices[i][1].to(device) for i in range(B)])
 
-        # 调整采样数量（GT 框占用 1 个）
-        G = max(1, G - 1)  # 实际采样数
-        G_gt = 1
+        if len(src_idx_map) == 0:
+            return {"grpo_logits": None, "grpo_ious": None, "grpo_labels": None, "grpo_cost_bbox": None}
+
+        Total_M = len(src_idx_map)
+
+        # ===== GT 信息 =====
+        all_tgt_labels = torch.cat([targets[i]["labels"][indices[i][1]] for i in range(B)])
+        all_tgt_boxes = torch.cat([targets[i]["boxes"][indices[i][1]] for i in range(B)])  # [Total_M, 4] (cxcywh)
+
+        # ===== 参考点（中心）=====
+        ref_points = outputs["ref_points"][batch_idx_map, src_idx_map].float()  # [Total_M, 2] in [0,1]
+
+        # 调整采样数量（如果使用 GT 框，需要预留 1 个位置）
+        G = max(1, G - 1)  # 实际采样数（GT 框占用 1 个）
+        G_gt = 1                  # GT 框占 1 个
 
         # ------------------------------------------------------------------
-        # 1) 四边独立随机采样：混合【好框(围绕GT)】+【探索框(完全随机)】
+        # 1) 四边独立随机采样：混合【好框(围绕pred)】+【探索框(完全随机)】
         # ------------------------------------------------------------------
         min_wh = 1e-4
 
-        good_frac = 0.55
+        # 组内比例：多少个“好框”
+        good_frac = 0.55  # 0.2~0.5 都可试
         G_good = max(1, int(round(G * good_frac)))
         G_rand = G - G_good
 
-        # ========== A) 好框：围绕 GT 框做四边小扰动 ==========
-        gt_cx = all_tgt_boxes[:, 0].unsqueeze(1)  # [Total_M, 1]
-        gt_cy = all_tgt_boxes[:, 1].unsqueeze(1)
-        gt_w = all_tgt_boxes[:, 2].unsqueeze(1)
-        gt_h = all_tgt_boxes[:, 3].unsqueeze(1)
+        # ========== A) 好框：围绕 pred_boxes 做四边小扰动 ==========
+        # 用 matched query 对应的当前预测框作为 base（比 ref_points 更接近“好框”）
+        base_pred_cxcywh = outputs["pred_boxes"][batch_idx_map, src_idx_map].float()  # [Total_M, 4] in [0,1]
+        base_xyxy = box_cxcywh_to_xyxy(base_pred_cxcywh).clamp(0.0, 1.0)
+        bx1, by1, bx2, by2 = base_xyxy.unbind(-1)
 
-        # 将 GT 转为 xyxy
-        gt_xyxy = box_cxcywh_to_xyxy(all_tgt_boxes)
-        bx1, by1, bx2, by2 = gt_xyxy.unbind(-1)
-
-        # 计算 GT 的 ltrb
+        # 计算 base 的 ltrb（相对中心）
         cx0 = (bx1 + bx2) * 0.5
         cy0 = (by1 + by2) * 0.5
         l0 = (cx0 - bx1).clamp(min=min_wh)
@@ -1189,11 +1229,13 @@ class VisualClassifier(nn.Module):
         r0 = (bx2 - cx0).clamp(min=min_wh)
         b0 = (by2 - cy0).clamp(min=min_wh)
 
-        # 乘性扰动
+        # 对 ltrb 乘性扰动：更稳（不会出现负数），同时允许一定扩张/收缩
+        # sigma 越大，“好框”也会更散；建议 0.10~0.25
         sigma = 0.18
         noise = torch.randn((Total_M, G_good, 4), device=device) * sigma
+        # 限制极端值，避免仍然太离谱
         noise = noise.clamp(-0.7, 0.7)
-        mult = noise.exp()
+        mult = noise.exp()  # lognormal multiplier in (0, +inf)
 
         l_good = l0.unsqueeze(1) * mult[..., 0]
         t_good = t0.unsqueeze(1) * mult[..., 1]
@@ -1210,25 +1252,32 @@ class VisualClassifier(nn.Module):
 
         x2_good = torch.maximum(x2_good, x1_good + min_wh)
         y2_good = torch.maximum(y2_good, y1_good + min_wh)
-        bboxes_good_xyxy = torch.stack([x1_good, y1_good, x2_good, y2_good], dim=-1)
+        bboxes_good_xyxy = torch.stack([x1_good, y1_good, x2_good, y2_good], dim=-1)  # [Total_M, G_good, 4]
 
-        # ========== B) 坏框：随机扰动，产生低 IoU ==========
+        # ========== B) 坏框：接近好框，但 IoU 尽量接近一个小目标值 ==========
         if G_rand > 0:
+            # 目标 IoU（你希望大约 0.1）
             target_iou = 0.10
+            # 候选池倍率：越大越容易挑到接近 target_iou 的框，但计算更贵
             pool_factor = 6
             P = max(G_rand, G_rand * pool_factor)
 
-            sigma_bad = 0.35
+            # 以 pred_box 为中心，做“中等幅度”的乘性扰动，保证不离谱但能产生低 IoU
+            # sigma_bad 比 sigma 大一些，且允许一定平移（shift）
+            sigma_bad = 0.35  # 0.25~0.45 建议
             noise_bad = torch.randn((Total_M, P, 4), device=device) * sigma_bad
             noise_bad = noise_bad.clamp(-1.2, 1.2)
             mult_bad = noise_bad.exp()
 
+            # 尺度扰动：从 pred 的 ltrb 扩张/收缩
             l_bad = l0.unsqueeze(1) * mult_bad[..., 0]
             t_bad = t0.unsqueeze(1) * mult_bad[..., 1]
             r_bad = r0.unsqueeze(1) * mult_bad[..., 2]
             b_bad = b0.unsqueeze(1) * mult_bad[..., 3]
 
-            shift_scale = 0.60
+            # 再加一点“中心平移”，让它更容易从 GT 上挪开（但仍在附近）
+            # shift 量与 box 尺度成比例，避免小框平移过大
+            shift_scale = 0.60  # 越大越容易低 IoU；0.4~0.8
             dx = torch.randn((Total_M, P), device=device).clamp(-2.0, 2.0) * (l0 + r0).unsqueeze(1) * 0.5 * shift_scale
             dy = torch.randn((Total_M, P), device=device).clamp(-2.0, 2.0) * (t0 + b0).unsqueeze(1) * 0.5 * shift_scale
 
@@ -1243,47 +1292,51 @@ class VisualClassifier(nn.Module):
             x2 = torch.maximum(x2, x1 + min_wh)
             y2 = torch.maximum(y2, y1 + min_wh)
 
-            bboxes_pool_xyxy = torch.stack([x1, y1, x2, y2], dim=-1)
-            bboxes_pool_cxcywh = box_xyxy_to_cxcywh(bboxes_pool_xyxy)
+            bboxes_pool_xyxy = torch.stack([x1, y1, x2, y2], dim=-1)  # [Total_M, P, 4]
+            bboxes_pool_cxcywh = box_xyxy_to_cxcywh(bboxes_pool_xyxy)  # [Total_M, P, 4]
 
+            # 计算 pool 中每个候选与对应 GT 的 IoU
             pool_flat = bboxes_pool_cxcywh.reshape(-1, 4)
             tgt_flat = all_tgt_boxes.unsqueeze(1).expand(-1, P, -1).reshape(-1, 4)
 
+            # IoU: [Total_M*P]
             pool_iou = torch.diag(
-                box_iou(
+                generalized_box_iou(
                     box_cxcywh_to_xyxy(pool_flat),
                     box_cxcywh_to_xyxy(tgt_flat),
-                )[0]
+                )
             ).view(Total_M, P)
 
+            # 只允许合法 iou 范围；并过滤掉明显“好框”（比如 >0.3）
             pool_iou = pool_iou.clamp(0.0, 1.0)
             bad_mask = (pool_iou < 0.30)
 
+            # 打分：越接近 target_iou 越好；不满足 bad_mask 的给极大惩罚
             score = (pool_iou - target_iou).abs()
             score = score + (~bad_mask) * 10.0
 
+            # 选出每个样本最接近 target_iou 的 G_rand 个
+            # idx: [Total_M, G_rand]
             _, idx = torch.topk(score, k=G_rand, dim=1, largest=False)
 
-            idx4 = idx.unsqueeze(-1).expand(-1, -1, 4)
-            bboxes_rand_xyxy = torch.gather(bboxes_pool_xyxy, dim=1, index=idx4)
-
-            del bboxes_pool_xyxy, bboxes_pool_cxcywh, pool_flat, tgt_flat, pool_iou, score
-            torch.cuda.empty_cache()
+            # gather 出最终坏框
+            idx4 = idx.unsqueeze(-1).expand(-1, -1, 4)  # [Total_M, G_rand, 4]
+            bboxes_rand_xyxy = torch.gather(bboxes_pool_xyxy, dim=1, index=idx4)  # [Total_M, G_rand, 4]
 
             bboxes_g_xyxy = torch.cat([bboxes_good_xyxy, bboxes_rand_xyxy], dim=1)
         else:
             bboxes_g_xyxy = bboxes_good_xyxy
 
-        # 将 GT 框本身加入
-        gt_boxes_xyxy = box_cxcywh_to_xyxy(all_tgt_boxes).clamp(0.0, 1.0)
-        gt_boxes_xyxy = gt_boxes_xyxy.unsqueeze(1)
+        # 将 GT 框转换为 xyxy 格式
+        gt_boxes_xyxy = box_cxcywh_to_xyxy(all_tgt_boxes).clamp(0.0, 1.0)  # [Total_M, 4]
+        gt_boxes_xyxy = gt_boxes_xyxy.unsqueeze(1)  # [Total_M, 1, 4]
+        # 合并：好框 + 坏框 + GT 框
         bboxes_g_xyxy = torch.cat([bboxes_g_xyxy, gt_boxes_xyxy], dim=1)
 
-        bboxes_g_cxcywh = box_xyxy_to_cxcywh(bboxes_g_xyxy)
+        bboxes_g_cxcywh = box_xyxy_to_cxcywh(bboxes_g_xyxy)     # [Total_M, G, 4]
         bboxes_g_cxcywh = torch.nan_to_num(bboxes_g_cxcywh, nan=0.5, posinf=1.0, neginf=0.0).clamp(0.0, 1.0)
 
         G = bboxes_g_cxcywh.shape[1]
-
         # ------------------------------------------------------------------
         # 2) 计算 IoU / cost
         # ------------------------------------------------------------------
@@ -1291,32 +1344,34 @@ class VisualClassifier(nn.Module):
         samp_flat = bboxes_g_cxcywh.reshape(-1, 4)
 
         grpo_ious = torch.diag(
-            box_iou(
+            generalized_box_iou(
                 box_cxcywh_to_xyxy(samp_flat),
                 box_cxcywh_to_xyxy(tgt_expand),
-            )[0]
+            )
         ).view(Total_M, G)
 
         cost_bbox = F.l1_loss(samp_flat, tgt_expand, reduction="none").sum(dim=-1).view(Total_M, G)
 
+        # 回填供可视化/调试
+        dec_out_grpo_bboxes = torch.zeros((B, N, G, 4), device=device)
+        dec_out_grpo_bboxes[batch_idx_map, src_idx_map] = bboxes_g_cxcywh
+
         # ------------------------------------------------------------------
         # 3) padded_boxes -> VPE -> logits
         # ------------------------------------------------------------------
-        # 按 batch 组织
-        padded_boxes = torch.zeros((B, Total_M * G, 4), device=device)
-        mask = torch.zeros((B, Total_M * G), dtype=torch.bool, device=device)
-        
+        max_m = max([len(indices[i][0]) for i in range(B)])
+        padded_boxes = torch.zeros((B, max_m * G, 4), device=device)
+        mask = torch.zeros((B, max_m * G), dtype=torch.bool, device=device)
+
         bboxes_g_cxcywh_flat = bboxes_g_cxcywh.reshape(-1, 4)
-        
+
         curr_idx = 0
         for i in range(B):
-            n_gts = gt_per_image[i]
-            if n_gts > 0:
-                start = curr_idx * G
-                end = (curr_idx + n_gts) * G
-                padded_boxes[i, :n_gts * G] = bboxes_g_cxcywh_flat[start:end]
-                mask[i, :n_gts * G] = True
-                curr_idx += n_gts
+            n_m = len(indices[i][0])
+            if n_m > 0:
+                padded_boxes[i, : n_m * G] = bboxes_g_cxcywh_flat[curr_idx * G : (curr_idx + n_m) * G]
+                mask[i, : n_m * G] = True
+                curr_idx += n_m
 
         if not isinstance(multi_scale_feats, (list, tuple)):
             multi_scale_feats = [multi_scale_feats]
@@ -1324,29 +1379,31 @@ class VisualClassifier(nn.Module):
         vpe_feats_padded = self.vpe(reference_boxes=padded_boxes, multi_scale_feats=multi_scale_feats)
         if isinstance(vpe_feats_padded, list):
             vpe_feats_padded = vpe_feats_padded[-1]
-        box_features = vpe_feats_padded[mask]
+        box_features = vpe_feats_padded[mask]  # [Total_M*G, C]
 
-        grpo_logits = self.cls_head(box_features).view(Total_M, G, -1)
+        matched_queries = outputs["output"][batch_idx_map, src_idx_map]  # [Total_M, C]
+        matched_queries_expand = matched_queries.unsqueeze(1).expand(-1, G, -1).reshape(-1, matched_queries.shape[-1])
 
-        # batch 索引
-        grpo_batch_idx = []
-        for i, num_gts in enumerate(gt_per_image):
-            for _ in range(num_gts * G):
-                grpo_batch_idx.append(i)
-        grpo_batch_idx = torch.tensor(grpo_batch_idx, device=device)
+        # fused_feats = box_features + matched_queries_expand
+        fused_feats = fused_feats
+        grpo_logits = self.cls_head(fused_feats).view(Total_M, G, -1)
 
+        padded_batch_idx = torch.arange(B, device=device).view(B, 1).expand(B, padded_boxes.shape[1])
+        batch_id_for_each_item = padded_batch_idx[mask]
+        grpo_boxes = padded_boxes[mask]  # [Total_M*G, 4]  (格式与 self.vpe(reference_boxes=...)一致)
+        grpo_batch_idx = batch_id_for_each_item
         return {
             "grpo_logits": grpo_logits,
             "grpo_ious": grpo_ious,
             "grpo_cost_bbox": cost_bbox,
             "grpo_labels": all_tgt_labels,
-            "grpo_feats": box_features,
-            "grpo_boxes": bboxes_g_cxcywh_flat,
-            "grpo_batch_idx": grpo_batch_idx,
-            "dec_out_grpo_bboxes": None,
+            "grpo_feats": fused_feats,
+            "grpo_boxes": grpo_boxes,              
+            "grpo_batch_idx": grpo_batch_idx, 
+            "dec_out_grpo_bboxes": dec_out_grpo_bboxes,
             "vpe_multi_scale_feats": [f.detach().float() for f in multi_scale_feats],
         }
-
+ 
     def sample_grpo_features1(
         self,
         multi_scale_feats,
@@ -1449,10 +1506,10 @@ class VisualClassifier(nn.Module):
         samp_flat = bboxes_g_cxcywh.reshape(-1, 4)
 
         grpo_ious = torch.diag(
-            box_iou(
+            generalized_box_iou(
                 box_cxcywh_to_xyxy(samp_flat),
                 box_cxcywh_to_xyxy(tgt_expand),
-            )[0]
+            )
         ).view(Total_M, G)
 
         cost_bbox = F.l1_loss(samp_flat, tgt_expand, reduction="none").sum(dim=-1).view(Total_M, G)
@@ -1562,94 +1619,6 @@ def rcnn_iou_match(pred_boxes, targets, pos_threshold=0.6, neg_threshold=0.3):
 
         # 负样本：IoU < neg_threshold
         neg_mask = max_ious < neg_threshold
-        neg_src_idx = torch.where(neg_mask)[0]
-        neg_indices.append(neg_src_idx)
-
-    return pos_indices, neg_indices
-
-def rcnn_iou_match_one_to_one(pred_boxes, targets, pos_threshold=0.6, neg_threshold=0.3):
-    """
-    一对一匹配：每个 GT 最多匹配一个预测框，每个预测框最多匹配一个 GT
-    
-    Args:
-        pred_boxes: [B, N, 4] (cxcywh)
-        targets: list of dicts, 每个包含 'boxes' (cxcywh)
-        pos_threshold: 正样本 IoU 阈值 (默认 0.7)
-        neg_threshold: 负样本 IoU 阈值 (默认 0.3)
-    
-    Returns:
-        pos_indices: list of (src_idx, tgt_idx) - 正样本匹配（一对一）
-        neg_indices: list of src_idx - 负样本索引
-    """
-    B, N, _ = pred_boxes.shape
-    device = pred_boxes.device
-
-    # 转 xyxy
-    boxes_xyxy = box_cxcywh_to_xyxy(pred_boxes)
-
-    pos_indices = []
-    neg_indices = []
-
-    for i in range(B):
-        gt_boxes = box_cxcywh_to_xyxy(targets[i]["boxes"])
-        num_gts = len(gt_boxes)
-
-        # 没有 GT 的情况：所有 query 都是负样本
-        if num_gts == 0:
-            pos_indices.append((
-                torch.empty(0, dtype=torch.long, device=device),
-                torch.empty(0, dtype=torch.long, device=device)
-            ))
-            neg_indices.append(torch.arange(N, device=device))
-            continue
-
-        # IoU: [N, M]
-        ious = box_iou(boxes_xyxy[i], gt_boxes)[0]  # [N, num_gts]
-
-        # ========== 一对一匹配：贪心匹配 ==========
-        # 复制 ious 避免修改原矩阵
-        ious_copy = ious.clone()
-        
-        matched_src = []
-        matched_tgt = []
-        
-        # 重复匹配直到所有高IoU的都被匹配
-        while True:
-            # 找到最大IoU的位置
-            max_iou = ious_copy.max()
-            if max_iou < pos_threshold:
-                break
-            
-            # 找到最大IoU对应的 src 和 tgt 索引
-            flat_idx = torch.argmax(ious_copy).item()
-            src_idx = flat_idx // num_gts
-            tgt_idx = flat_idx % num_gts
-            
-            matched_src.append(src_idx)
-            matched_tgt.append(tgt_idx)
-            
-            # 删除已匹配的行和列
-            ious_copy[src_idx, :] = -1  # 该预测框不再参与匹配
-            ious_copy[:, tgt_idx] = -1  # 该GT不再参与匹配
-        
-        # 修复：明确指定 dtype=torch.long
-        if len(matched_src) > 0:
-            matched_src = torch.tensor(matched_src, device=device, dtype=torch.long)
-            matched_tgt = torch.tensor(matched_tgt, device=device, dtype=torch.long)
-        else:
-            matched_src = torch.empty(0, device=device, dtype=torch.long)
-            matched_tgt = torch.empty(0, device=device, dtype=torch.long)
-
-        # 正样本：一对一匹配的结果
-        pos_indices.append((matched_src, matched_tgt))
-
-        # 负样本：未被匹配且 IoU < neg_threshold 的预测框
-        is_matched = torch.zeros(N, dtype=torch.bool, device=device)
-        if len(matched_src) > 0:
-            is_matched[matched_src] = True
-        
-        max_ious, _ = ious.max(dim=1)
-        neg_mask = (~is_matched) & (max_ious < neg_threshold)
         neg_src_idx = torch.where(neg_mask)[0]
         neg_indices.append(neg_src_idx)
 
@@ -1917,7 +1886,7 @@ class VisualPromptEncoder(nn.Module):
         device = reference_boxes.device
 
         # 频域增强
-        multi_scale_feats = self.freq_enhancer(multi_scale_feats)
+        # multi_scale_feats = self.freq_enhancer(multi_scale_feats)
 
         # --- 坐标编码 ---
         query_sine_embed = self.coordinate_to_encoding(reference_boxes)
@@ -2022,7 +1991,6 @@ class ClassificationHead(nn.Module):
 
     def forward(self, x):
         return self.head(x)
-
 
 class MultiScaleFrequencyEnhance(nn.Module):
     """

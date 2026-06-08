@@ -7,7 +7,7 @@ ema:
   start: 0
 
 
-epochs: 32
+epochs: 72
 clip_max_norm: 0.1
 
 
@@ -28,7 +28,7 @@ optimizer:
 
 lr_scheduler:
   type: MultiStepLR
-  milestones: [82]
+  milestones: [72]
   gamma: 0.1
 
 lr_warmup_scheduler:

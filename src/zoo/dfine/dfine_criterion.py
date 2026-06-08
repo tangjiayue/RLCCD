@@ -110,127 +110,46 @@ class DFINECriterion(nn.Module):
         prob = src_logits.sigmoid()
         target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
         
-        #修改类别损失，用软标签作为类别损失而不是IOU
-        pos_weights = torch.zeros_like(src_logits)
-        neg_weights =  prob ** self.label_gamma
-        pos_idx_c = idx + (target_classes_o.cpu(), )
+        # #修改类别损失，用软标签作为类别损失而不是IOU
+        # pos_weights = torch.zeros_like(src_logits)
+        # neg_weights =  prob ** self.label_gamma
+        # pos_idx_c = idx + (target_classes_o.cpu(), )
         
-        with torch.no_grad():
-            t = prob[pos_idx_c].detach()**self.aux_alpha * ious ** (1-self.aux_alpha)
-            t = torch.clamp(t, 0.01).detach()
-            t = t * loc_weight
-        pos_weights[pos_idx_c] = t.to(pos_weights.dtype) 
-        neg_weights[pos_idx_c] = (1 -t.to(pos_weights.dtype))
-        loss = -pos_weights * prob.log() - neg_weights * (1-prob).log()
-        loss = loss.mean(1).sum() * src_logits.shape[1] / num_boxes
+        # with torch.no_grad():
+        #     t = prob[pos_idx_c].detach()**self.aux_alpha * ious ** (1-self.aux_alpha)
+        #     t = torch.clamp(t, 0.01).detach()
+        #     t = t * loc_weight
+        # pos_weights[pos_idx_c] = t.to(pos_weights.dtype) 
+        # neg_weights[pos_idx_c] = (1 -t.to(pos_weights.dtype))
+        # loss = -pos_weights * prob.log() - neg_weights * (1-prob).log()
+        # loss = loss.mean(1).sum() * src_logits.shape[1] / num_boxes
 
-        return {"loss_vfl": loss}
+        # return {"loss_vfl": loss}
 
-        # target_classes = torch.full(
-        #     src_logits.shape[:2], self.num_classes, dtype=torch.int64, device=src_logits.device
-        # )
-        # target_classes[idx] = target_classes_o
-        # target = F.one_hot(target_classes, num_classes=self.num_classes + 1)[..., :-1]
+        target_classes = torch.full(
+            src_logits.shape[:2], self.num_classes, dtype=torch.int64, device=src_logits.device
+        )
+        target_classes[idx] = target_classes_o
+        target = F.one_hot(target_classes, num_classes=self.num_classes + 1)[..., :-1]
 
-        # target_score_o = torch.zeros_like(target_classes, dtype=src_logits.dtype)
-        # target_score_o[idx] = ious.to(target_score_o.dtype) * loc_weight   #新加loc_weight
-        # target_score = target_score_o.unsqueeze(-1) * target
+        target_score_o = torch.zeros_like(target_classes, dtype=src_logits.dtype)
+        target_score_o[idx] = ious.to(target_score_o.dtype) * loc_weight   #新加loc_weight
+        target_score = target_score_o.unsqueeze(-1) * target
 
-        # pred_score = F.sigmoid(src_logits).detach()
-        ## loss_label_mal
+        pred_score = F.sigmoid(src_logits).detach()
+        # # loss_label_mal
         # target_score = target_score.pow(self.gamma)
         # if self.mal_alpha != None:
         #     weight = self.mal_alpha * pred_score.pow(self.gamma) * (1 - target) + target
         # else:
         #     weight = pred_score.pow(self.gamma) * (1 - target) + target
-        # #weight = self.alpha * pred_score.pow(self.gamma) * (1 - target) + target_score
+        weight = self.alpha * pred_score.pow(self.gamma) * (1 - target) + target_score
 
-        # loss = F.binary_cross_entropy_with_logits(
-        #     src_logits, target_score, weight=weight, reduction="none"
-        # )
-        # loss = loss.mean(1).sum() * src_logits.shape[1] / num_boxes
-        # return {"loss_vfl": loss}
-
-
-    def grpo_loss_v1(self, outputs, targets, indices, num_boxes, **kwargs):
-        """
-        Reward = -Classification_Loss
-        作用：一组内，预测类别更好的的采样框类别分数会输出更高，然后让最后的置信度更高，最后选择预测框的时候先根据置信度排序，就会优先选择类被预测更好的框
-        """
-        final_losses = {}
-        if "pred_grpo_logits" in outputs and outputs["pred_grpo_logits"] is not None and outputs["pred_grpo_logits"].numel() != 0:
-            ref_cls_outputs = kwargs.get("ref_cls_outputs", None)
-            grpo_advantage_weight=0.2
-            grpo_beta=0.03
-            epsilon=1e-9
-
-            logits_g = outputs["pred_grpo_logits"]  # [B, N, G, C]
-            B, N, G, C = logits_g.shape
-            device = logits_g.device
-
-            # 提取所有正样本索引 [Total_M]  ,Total_M 是整个 Batch 中所有图片正样本的总和
-            idx = self._get_src_permutation_idx(indices)   
-            
-            src_boxes = outputs["dec_out_grpo_bboxes"][idx]    # [B, N, G, 4] (cxcywh) ->[Total_M, G, 4]
-            target_boxes = torch.cat([t["boxes"][i] for t, (_, i) in zip(targets, indices)], dim=0)
-            src_xyxy = box_cxcywh_to_xyxy(src_boxes)            # [Total_M, G, 4]
-            tgt_xyxy = box_cxcywh_to_xyxy(target_boxes).unsqueeze(1) # [Total_M, 1, 4]
-            curr_ious = get_pairwise_iou(src_xyxy.detach(), tgt_xyxy.detach()) # 直接得到 [Total_M, G]
-                  
-            # 准备对应的标签 [Total_M] -> 扩展为 [Total_M, G]
-            target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
-            tgt_labels = target_classes_o.view(-1, 1).expand(-1, G)
-
-            curr_logits = logits_g[idx].float()   # 提取匹配到的 Logits [Total_M, G, C]
-
-            # 计算 Reward 
-            # 计算全 Batch 展平后的 CrossEntropy
-            individual_loss = F.cross_entropy(
-                curr_logits.reshape(-1, C), 
-                tgt_labels.reshape(-1), 
-                reduction='none'
-            ).view(-1, G)
-            
-            rewards = -individual_loss + 2.0 * curr_ious  # 加上 IoU 项作为拉动力
-            
-            # 组内标准化 (Advantage)
-            mean_r = rewards.mean(dim=1, keepdim=True)
-            std_r = rewards.std(dim=1, keepdim=True, unbiased=False).clamp(min=1e-6)
-            advantages = (rewards - mean_r) / (std_r + epsilon) 
-
-            logp = F.log_softmax(curr_logits, dim=-1)
-            logp = logp.gather(2, tgt_labels.unsqueeze(-1)).squeeze(-1)  # [Total_M, G]
-            if ref_cls_outputs is not None:
-                ref_logits_g = ref_cls_outputs.view(B, -1, G, ref_cls_outputs.shape[-1])
-                ref_logits = ref_logits_g[idx]
-                ref_logp = F.log_softmax(ref_logits, dim=-1)
-                ref_logp = ref_logp.gather(2, tgt_labels.unsqueeze(-1)).squeeze(-1)  # [Total_M, G]
-
-                p = logp.exp()
-                pref = ref_logp.exp()
-                kl = (pref + epsilon) / (p + epsilon) - torch.log(pref + epsilon) + torch.log(p + epsilon) - 1
-            else:
-                kl = torch.zeros_like(logp)
-
-            # [Total_M, G] 每个点的 policy loss
-            element_loss = -grpo_advantage_weight * advantages + grpo_beta * kl 
-
-            # 将 element_loss 填回一个空白的 [B, N, G] 张量, 执行 .mean(1) (即在 Query 维度平均)
-            full_loss_tensor = torch.zeros((B, N, G),dtype=curr_logits.dtype,  device=device)
-            full_loss_tensor[idx] = element_loss
-            
-            # 聚合计算：
-            # full_loss_tensor.mean(2) -> 先对组内 G 取平均 [B, N]
-            # .mean(1)                -> 再对 Query 维度取平均 [B]
-            # .sum()                  -> 对 Batch 求和
-            # * N                     -> 恢复 Query 量级
-            # / num_boxes             -> 最终按目标数归一化
-            loss_rl = (full_loss_tensor.mean(dim=2).mean(dim=1).sum() * N) / num_boxes 
-            final_losses["loss_rl"] = loss_rl
-            del curr_logits, logp, advantages, rewards
-            if 'ref_logp' in locals(): del ref_logp
-
-        return final_losses
+        loss = F.binary_cross_entropy_with_logits(
+            src_logits, target_score, weight=weight, reduction="none"
+        )
+        loss = loss.mean(1).sum() * src_logits.shape[1] / num_boxes
+        return {"loss_vfl": loss}
 
     def loss_boxes(self, outputs, targets, indices, num_boxes, boxes_weight=None, loc_weight=1, **kwargs):
         """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
@@ -447,6 +366,88 @@ class DFINECriterion(nn.Module):
 
         return sum(losses) / len(losses)
 
+    
+    def grpo_loss_v1(self, outputs, targets, indices, num_boxes, **kwargs):
+        """
+        Reward = -Classification_Loss
+        作用：一组内，预测类别更好的的采样框类别分数会输出更高，然后让最后的置信度更高，最后选择预测框的时候先根据置信度排序，就会优先选择类被预测更好的框
+        """
+        final_losses = {}
+        if "pred_grpo_logits" in outputs and outputs["pred_grpo_logits"] is not None and outputs["pred_grpo_logits"].numel() != 0:
+            ref_cls_outputs = kwargs.get("ref_cls_outputs", None)
+            grpo_advantage_weight=0.2
+            grpo_beta=0.03
+            epsilon=1e-9
+
+            logits_g = outputs["pred_grpo_logits"]  # [B, N, G, C]
+            B, N, G, C = logits_g.shape
+            device = logits_g.device
+
+            # 提取所有正样本索引 [Total_M]  ,Total_M 是整个 Batch 中所有图片正样本的总和
+            idx = self._get_src_permutation_idx(indices)   
+            
+            src_boxes = outputs["dec_out_grpo_bboxes"][idx]    # [B, N, G, 4] (cxcywh) ->[Total_M, G, 4]
+            target_boxes = torch.cat([t["boxes"][i] for t, (_, i) in zip(targets, indices)], dim=0)
+            src_xyxy = box_cxcywh_to_xyxy(src_boxes)            # [Total_M, G, 4]
+            tgt_xyxy = box_cxcywh_to_xyxy(target_boxes).unsqueeze(1) # [Total_M, 1, 4]
+            curr_ious = get_pairwise_iou(src_xyxy.detach(), tgt_xyxy.detach()) # 直接得到 [Total_M, G]
+                  
+            # 准备对应的标签 [Total_M] -> 扩展为 [Total_M, G]
+            target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
+            tgt_labels = target_classes_o.view(-1, 1).expand(-1, G)
+
+            curr_logits = logits_g[idx].float()   # 提取匹配到的 Logits [Total_M, G, C]
+
+            # 计算 Reward 
+            # 计算全 Batch 展平后的 CrossEntropy
+            individual_loss = F.cross_entropy(
+                curr_logits.reshape(-1, C), 
+                tgt_labels.reshape(-1), 
+                reduction='none'
+            ).view(-1, G)
+            
+            rewards = -individual_loss + 2.0 * curr_ious  # 加上 IoU 项作为拉动力
+            
+            # 组内标准化 (Advantage)
+            mean_r = rewards.mean(dim=1, keepdim=True)
+            std_r = rewards.std(dim=1, keepdim=True, unbiased=False).clamp(min=1e-6)
+            advantages = (rewards - mean_r) / (std_r + epsilon) 
+
+            logp = F.log_softmax(curr_logits, dim=-1)
+            logp = logp.gather(2, tgt_labels.unsqueeze(-1)).squeeze(-1)  # [Total_M, G]
+            if ref_cls_outputs is not None:
+                ref_logits_g = ref_cls_outputs.view(B, -1, G, ref_cls_outputs.shape[-1])
+                ref_logits = ref_logits_g[idx]
+                ref_logp = F.log_softmax(ref_logits, dim=-1)
+                ref_logp = ref_logp.gather(2, tgt_labels.unsqueeze(-1)).squeeze(-1)  # [Total_M, G]
+
+                p = logp.exp()
+                pref = ref_logp.exp()
+                kl = (pref + epsilon) / (p + epsilon) - torch.log(pref + epsilon) + torch.log(p + epsilon) - 1
+            else:
+                kl = torch.zeros_like(logp)
+
+            # [Total_M, G] 每个点的 policy loss
+            element_loss = -grpo_advantage_weight * advantages + grpo_beta * kl 
+
+            # 将 element_loss 填回一个空白的 [B, N, G] 张量, 执行 .mean(1) (即在 Query 维度平均)
+            full_loss_tensor = torch.zeros((B, N, G),dtype=curr_logits.dtype,  device=device)
+            full_loss_tensor[idx] = element_loss
+            
+            # 聚合计算：
+            # full_loss_tensor.mean(2) -> 先对组内 G 取平均 [B, N]
+            # .mean(1)                -> 再对 Query 维度取平均 [B]
+            # .sum()                  -> 对 Batch 求和
+            # * N                     -> 恢复 Query 量级
+            # / num_boxes             -> 最终按目标数归一化
+            loss_rl = (full_loss_tensor.mean(dim=2).mean(dim=1).sum() * N) / num_boxes 
+            final_losses["loss_rl"] = loss_rl
+            del curr_logits, logp, advantages, rewards
+            if 'ref_logp' in locals(): del ref_logp
+
+        return final_losses
+
+
     def compute_riou_reward_matched(
         self,
         pred_boxes,    # (Nq, 4) cxcywh
@@ -531,9 +532,10 @@ class DFINECriterion(nn.Module):
     def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
         loss_map = {
             "boxes": self.loss_boxes,
+            "focal": self.loss_labels_focal,
             "vfl": self.loss_labels_vfl,
             "local": self.loss_local,
-            # "rl": self.grpo_loss_v1, 
+            # "rl": self.grpo_loss_v1,
         }
         assert loss in loss_map, f"do you really want to compute {loss} loss?"
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)

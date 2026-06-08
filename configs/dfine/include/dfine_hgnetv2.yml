@@ -22,7 +22,7 @@ VisualClassifier:
   gamma: 2.0
   reg_max: 32  #与decoder一样
   reg_scale: 4
-  weight_dict: {loss_cls: 1, loss_cls_aux: 1, loss_contrast: 0.2, loss_rl: 0.05}
+  weight_dict: {loss_cls: 1, loss_fusion_cls: 1, loss_debridement: 0.05, loss_contrast: 0.2, loss_img_proto: 5, loss_rl: 2.5}
   matcher:
     type: HungarianMatcher
     weight_dict: {cost_class: 2, cost_bbox: 5, cost_giou: 2}
@@ -92,13 +92,14 @@ DFINEPostProcessor:
 
 
 DFINECriterion:
+  # weight_dict: {loss_vfl: 1, loss_bbox: 5, loss_giou: 2, loss_fgl: 0.15, loss_ddf: 1.5, loss_rl: 6}
   weight_dict: {loss_vfl: 1, loss_bbox: 5, loss_giou: 2, loss_fgl: 0.15, loss_ddf: 1.5, loss_rl: 6}
   # losses: ['vfl', 'boxes', 'local', 'rl']
   losses: ['vfl', 'boxes', 'local']
   alpha: 0.75
   gamma: 2.0
   reg_max: 32
-  match_number: 1
+  match_number: 4
   tau: 1.5
   aux_alpha: 0.25
   label_gamma: 2

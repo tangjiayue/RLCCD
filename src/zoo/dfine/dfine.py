@@ -31,7 +31,6 @@ class DFINE(nn.Module):
         self.encoder = encoder
         self.VisualClassifier = VisualClassifier
 
-
     def forward(self, x, targets=None):
         x = self.backbone(x)
         x = self.encoder(x)
@@ -51,8 +50,8 @@ class DFINE(nn.Module):
         return outputs, x
     
 
-    def get_losses(self, outputs, ref_cls_outputs=None, old_cls_outputs=None):
-        return self.VisualClassifier.get_losses(outputs, ref_cls_outputs=ref_cls_outputs, old_cls_outputs=old_cls_outputs)
+    def get_losses(self, outputs, **kwargs):
+        return self.VisualClassifier.get_losses(outputs, **kwargs)
 
     def deploy(
         self,
